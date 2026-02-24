@@ -1,0 +1,7 @@
+mlx-whisper
+sounddevice
+soundfile
+numpy
+pyperclip
+pynput
+pywebview
