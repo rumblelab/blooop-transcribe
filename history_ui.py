@@ -6,13 +6,85 @@ Standalone pywebview window. Launched as a subprocess by bloop.py.
 
 import json
 import os
+import re
 import sqlite3
 import sys
+import threading
+import time
 
-DB_PATH    = os.path.expanduser("~/.bloop_flow/history.db")
+
+def _app_base_dir():
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass and os.path.isdir(meipass):
+            return meipass
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+APP_BASE_DIR = _app_base_dir()
+
+def _state_dir():
+    """Match the main app's resolved state dir (passed via BLOOOP_STATE_DIR)."""
+    env_dir = os.environ.get("BLOOOP_STATE_DIR")
+    if env_dir:
+        return os.path.abspath(os.path.expanduser(env_dir))
+    return os.path.expanduser("~/.bloop_flow")
+
+
+STATE_DIR = _state_dir()
+DB_PATH    = os.path.join(STATE_DIR, "history.db")
+SETTINGS_PATH = os.path.join(STATE_DIR, "settings.json")
+RUNTIME_STATUS_PATH = os.path.join(STATE_DIR, "runtime_status.json")
+COMMAND_PATH = os.path.join(STATE_DIR, "history_command.json")
+SETTINGS_FALLBACK = os.path.join(
+    APP_BASE_DIR,
+    ".bloop_flow",
+    "settings.json",
+)
 LIMIT      = 40
 HIDE_NOISE = True
 _NOISE     = {"no_audio", "too_short"}
+_PARENT_PID = os.environ.get("BLOOOP_PARENT_PID")
+_SETTINGS_LOCK = threading.Lock()
+_SETTINGS_ACTIVE_PATH = None
+
+_SETTINGS_DEFAULTS = {
+    "model": "mlx-community/whisper-small-mlx",
+    "auto_paste": True,
+    "latch_chunk_mode": True,
+    "latch_chunk_seconds": 10.0,
+    "silence_trim_preset": "normal",
+    "hotkey": "right_cmd",
+    "pill_window": True,
+    "pill_style": "bubbles",
+    "custom_vocab": ["Blooop"],
+}
+_SILENCE_PRESETS = {"off", "normal", "aggressive"}
+_HOTKEYS = {"right_cmd", "right_option", "right_shift"}
+_PILL_STYLES = {"bubbles", "spectrogram"}
+
+
+def _set_process_program_name(name="Blooop History"):
+    """Best-effort process name hint for macOS process surfaces."""
+    if sys.platform != "darwin":
+        return
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL("libc.dylib")
+        setprogname = getattr(libc, "setprogname", None)
+        if setprogname is not None:
+            setprogname(name.encode("utf-8"))
+    except Exception:
+        pass
+
+    try:
+        from AppKit import NSProcessInfo
+
+        NSProcessInfo.processInfo().setProcessName_(name)
+    except Exception:
+        pass
 
 
 def _set_macos_accessory_app():
@@ -26,6 +98,61 @@ def _set_macos_accessory_app():
         )
     except Exception:
         pass
+
+
+def _force_macos_ui_element():
+    """Stronger Dock-hiding fallback for helper subprocesses."""
+    if sys.platform != "darwin":
+        return
+    try:
+        import ctypes
+
+        class ProcessSerialNumber(ctypes.Structure):
+            _fields_ = [
+                ("highLongOfPSN", ctypes.c_uint32),
+                ("lowLongOfPSN", ctypes.c_uint32),
+            ]
+
+        app_services = ctypes.CDLL(
+            "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
+        )
+        get_current = app_services.GetCurrentProcess
+        transform = app_services.TransformProcessType
+        get_current.argtypes = [ctypes.POINTER(ProcessSerialNumber)]
+        get_current.restype = ctypes.c_int32
+        transform.argtypes = [ctypes.POINTER(ProcessSerialNumber), ctypes.c_uint32]
+        transform.restype = ctypes.c_int32
+
+        psn = ProcessSerialNumber()
+        if get_current(ctypes.byref(psn)) == 0:
+            # kProcessTransformToUIElementApplication
+            transform(ctypes.byref(psn), 4)
+    except Exception:
+        pass
+
+
+def _watch_parent_and_exit():
+    """Exit helper if the main Blooop process is gone."""
+    if not _PARENT_PID:
+        return
+    try:
+        ppid = int(_PARENT_PID)
+    except Exception:
+        return
+    if ppid <= 1:
+        return
+
+    while True:
+        try:
+            os.kill(ppid, 0)
+        except ProcessLookupError:
+            os._exit(0)
+        except PermissionError:
+            # If we can't probe, keep running.
+            pass
+        except Exception:
+            pass
+        time.sleep(2.0)
 
 
 # ── DB helpers ─────────────────────────────────────────────────────────────────
@@ -81,11 +208,202 @@ def _delete_row(hid):
         pass
 
 
+def _clear_rows():
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=5)
+        try:
+            conn.execute("DELETE FROM history")
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
+def _settings_candidates():
+    out = [SETTINGS_PATH]
+    if SETTINGS_FALLBACK not in out:
+        out.append(SETTINGS_FALLBACK)
+    return out
+
+
+def _normalize_custom_vocab(raw):
+    if isinstance(raw, str):
+        items = re.split(r"[\n,;]+", raw)
+    elif isinstance(raw, (list, tuple)):
+        items = list(raw)
+    else:
+        return list(_SETTINGS_DEFAULTS["custom_vocab"])
+
+    out = []
+    seen = set()
+    for item in items:
+        if not isinstance(item, str):
+            continue
+        text = re.sub(r"\s+", " ", item).strip()
+        if not text:
+            continue
+        key = text.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(text[:80].rstrip())
+        if len(out) >= 64:
+            break
+    return out or list(_SETTINGS_DEFAULTS["custom_vocab"])
+
+
+def _settings_normalize(raw):
+    out = dict(_SETTINGS_DEFAULTS)
+    if not isinstance(raw, dict):
+        return out
+
+    model = raw.get("model")
+    if isinstance(model, str):
+        model = model.strip()
+        if model:
+            out["model"] = model
+
+    if isinstance(raw.get("auto_paste"), bool):
+        out["auto_paste"] = raw["auto_paste"]
+    if isinstance(raw.get("latch_chunk_mode"), bool):
+        out["latch_chunk_mode"] = raw["latch_chunk_mode"]
+    if isinstance(raw.get("pill_window"), bool):
+        out["pill_window"] = raw["pill_window"]
+
+    pill_style = raw.get("pill_style")
+    if isinstance(pill_style, str) and pill_style in _PILL_STYLES:
+        out["pill_style"] = pill_style
+
+    try:
+        sec = float(raw.get("latch_chunk_seconds"))
+        if sec == sec and sec not in (float("inf"), float("-inf")):
+            out["latch_chunk_seconds"] = max(2.0, min(60.0, sec))
+    except Exception:
+        pass
+
+    silence = raw.get("silence_trim_preset")
+    if isinstance(silence, str) and silence in _SILENCE_PRESETS:
+        out["silence_trim_preset"] = silence
+
+    hotkey = raw.get("hotkey")
+    if isinstance(hotkey, str) and hotkey in _HOTKEYS:
+        out["hotkey"] = hotkey
+
+    if "custom_vocab" in raw:
+        out["custom_vocab"] = _normalize_custom_vocab(raw.get("custom_vocab"))
+
+    return out
+
+
+def _settings_pick_write_path():
+    global _SETTINGS_ACTIVE_PATH
+    if _SETTINGS_ACTIVE_PATH:
+        return _SETTINGS_ACTIVE_PATH
+    for path in _settings_candidates():
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            probe = f"{path}.probe.{os.getpid()}"
+            with open(probe, "w", encoding="utf-8"):
+                pass
+            os.unlink(probe)
+            _SETTINGS_ACTIVE_PATH = path
+            return path
+        except Exception:
+            continue
+    _SETTINGS_ACTIVE_PATH = SETTINGS_PATH
+    return SETTINGS_PATH
+
+
+def _settings_load():
+    global _SETTINGS_ACTIVE_PATH
+    for path in _settings_candidates():
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                raw = json.load(fh)
+            _SETTINGS_ACTIVE_PATH = path
+            return _settings_normalize(raw)
+        except Exception:
+            continue
+    _settings_pick_write_path()
+    return dict(_SETTINGS_DEFAULTS)
+
+
+def _runtime_status_load():
+    try:
+        with open(RUNTIME_STATUS_PATH, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+        if isinstance(raw, dict):
+            return raw
+    except Exception:
+        pass
+    return {}
+
+
+def _command_state_load():
+    try:
+        with open(COMMAND_PATH, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+        if isinstance(raw, dict):
+            return {
+                "raise_seq": int(raw.get("raise_seq") or 0),
+                "settings_seq": int(raw.get("settings_seq") or 0),
+            }
+    except Exception:
+        pass
+    return {"raise_seq": 0, "settings_seq": 0}
+
+
+def _settings_save(new_values):
+    with _SETTINGS_LOCK:
+        current = _settings_load()
+        if isinstance(new_values, dict):
+            current.update(new_values)
+        out = _settings_normalize(current)
+        path = _settings_pick_write_path()
+
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.tmp.{os.getpid()}"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(out, fh, indent=2, sort_keys=True)
+                fh.write("\n")
+            os.replace(tmp, path)
+        finally:
+            try:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+            except Exception:
+                pass
+        return out
+
+
 # ── JS API ─────────────────────────────────────────────────────────────────────
 
 class API:
     def get_history(self):
         return json.dumps(_list_rows())
+
+    def get_settings(self):
+        return json.dumps(_settings_load())
+
+    def get_runtime_status(self):
+        return json.dumps(_runtime_status_load())
+
+    def get_command_state(self):
+        return json.dumps(_command_state_load())
+
+    def activate_window(self):
+        """Bring this helper app to the front of macOS apps."""
+        if sys.platform != "darwin":
+            return
+        try:
+            from AppKit import NSApplication
+            NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+        except Exception:
+            pass
 
     def copy_text(self, text):
         try:
@@ -96,6 +414,16 @@ class API:
 
     def delete_row(self, hid):
         _delete_row(hid)
+
+    def clear_history(self):
+        _clear_rows()
+
+    def save_settings(self, raw):
+        try:
+            payload = json.loads(raw) if isinstance(raw, str) else raw
+        except Exception:
+            payload = {}
+        return json.dumps(_settings_save(payload))
 
 
 # ── HTML ───────────────────────────────────────────────────────────────────────
@@ -110,19 +438,20 @@ HTML = """<!DOCTYPE html>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 :root {
-  --bg:        #0d1117;
-  --surface:   #161b22;
-  --surface-2: #1c2128;
-  --border:    #21262d;
-  --border-2:  #30363d;
-  --fg:        #e6edf3;
-  --fg-muted:  #7d8590;
-  --fg-faint:  #484f58;
-  --green:     #3fb950;
-  --blue:      #58a6ff;
-  --yellow:    #d29922;
-  --red:       #f85149;
-  --gray:      #6e7681;
+  /* Deep-water palette — matches the bubbles pill, not a terminal. */
+  --bg:        #0a121c;
+  --surface:   #0f1b29;
+  --surface-2: #142334;
+  --border:    #1a2c3e;
+  --border-2:  #27425a;
+  --fg:        #dce9f2;
+  --fg-muted:  #7e96a8;
+  --fg-faint:  #46586a;
+  --green:     #3ad6a5;
+  --blue:      #6fd8ff;
+  --yellow:    #c9b79b;
+  --red:       #ff7e6b;
+  --gray:      #5d7488;
 }
 
 html { height: 100%; }
@@ -149,11 +478,22 @@ body {
   position: sticky;
   top: 0;
   z-index: 50;
-  background: var(--bg);
+  background: linear-gradient(180deg, rgba(10,18,28,0.98), rgba(10,18,28,0.9));
+  backdrop-filter: blur(6px);
   border-bottom: 1px solid var(--border);
-  padding: 13px 16px 11px;
+  padding: 12px 12px 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.header-left {
   display: flex;
   align-items: baseline;
+  gap: 8px;
+}
+.header-right {
+  display: flex;
+  align-items: center;
   gap: 8px;
 }
 .header-title {
@@ -166,9 +506,176 @@ body {
   color: var(--fg-muted);
 }
 
+/* ── settings ── */
+.settings-toggle {
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  border: 1px solid var(--border-2);
+  background: var(--surface-2);
+  color: var(--fg-muted);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: transform 0.14s ease, color 0.12s, border-color 0.12s, background 0.12s;
+}
+.settings-toggle:hover {
+  color: var(--fg);
+  border-color: var(--blue);
+}
+.settings-toggle.is-open {
+  background: #10283a;
+  color: var(--blue);
+  border-color: #2a5a74;
+  transform: rotate(20deg);
+}
+.settings-live {
+  min-width: 52px;
+  text-align: right;
+  font-size: 11px;
+  color: var(--fg-faint);
+}
+.btn-clear {
+  height: 28px;
+  padding: 0 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border-2);
+  background: var(--surface-2);
+  color: var(--fg-muted);
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  line-height: 1;
+  transition: color 0.12s, border-color 0.12s, background 0.12s;
+}
+.btn-clear:hover { color: var(--fg); }
+.btn-clear.is-armed {
+  color: var(--red);
+  border-color: #6e3a2c;
+  background: #2d1712;
+}
+
+.settings {
+  margin: 8px 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 10px;
+  overflow: hidden;
+  max-height: 560px;
+  opacity: 1;
+  transform: translateY(0);
+  transition: max-height 0.2s ease, opacity 0.16s ease, transform 0.16s ease, margin 0.16s ease, padding 0.16s ease;
+}
+.settings.is-collapsed {
+  max-height: 0;
+  opacity: 0;
+  transform: translateY(-4px);
+  margin-top: 0;
+  margin-bottom: 0;
+  padding-top: 0;
+  padding-bottom: 0;
+  border-width: 0;
+}
+.settings-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.settings-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg);
+}
+.settings-status {
+  font-size: 11px;
+  color: var(--fg-muted);
+}
+.settings-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 9px;
+}
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.field.full { grid-column: 1 / span 2; }
+.field label {
+  font-size: 11px;
+  color: var(--fg-muted);
+}
+.field input[type="number"],
+.field textarea,
+.field select {
+  width: 100%;
+  border: 1px solid var(--border-2);
+  border-radius: 6px;
+  padding: 6px 8px;
+  background: var(--surface-2);
+  color: var(--fg);
+  font: inherit;
+}
+.field textarea {
+  resize: vertical;
+  min-height: 64px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.field select option { color: var(--fg); }
+.field input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+}
+.check-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--fg);
+}
+.settings-hint {
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--fg-muted);
+}
+.settings-runtime {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--fg-muted);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 15px;
+}
+.settings-runtime.is-error {
+  color: var(--red);
+}
+.runtime-spinner {
+  width: 11px;
+  height: 11px;
+  border: 2px solid var(--border-2);
+  border-top-color: var(--blue);
+  border-radius: 50%;
+  opacity: 0;
+  flex: 0 0 auto;
+  animation: runtime-spin 0.8s linear infinite;
+}
+.runtime-spinner.is-active {
+  opacity: 1;
+}
+@keyframes runtime-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
 /* ── card list ── */
 .cards {
-  padding: 8px 8px 60px;
+  padding: 0 8px 60px;
   display: flex;
   flex-direction: column;
   gap: 5px;
@@ -179,11 +686,18 @@ body {
   display: flex;
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: 11px;
   overflow: hidden;
-  transition: border-color 0.12s;
+  transition: border-color 0.18s;
 }
 .card:hover { border-color: var(--border-2); }
+.card[data-st="recording"] .status-dot {
+  animation: dotpulse 1.6s ease-in-out infinite;
+}
+@keyframes dotpulse {
+  0%, 100% { transform: scale(0.85); opacity: 0.6; }
+  50% { transform: scale(1.2); opacity: 1; }
+}
 
 /* left accent strip */
 .card-accent {
@@ -296,9 +810,9 @@ body {
   background: var(--border-2);
 }
 .btn-copy.copied {
-  background: #1a3a26;
+  background: #0e3a30;
   color: var(--green);
-  border-color: #2a6a3a;
+  border-color: #1d6a55;
   pointer-events: none;
 }
 .btn-delete {
@@ -325,20 +839,110 @@ body {
 <body>
 
 <div class="header">
-  <span class="header-title">Bloop History</span>
-  <span class="header-count" id="count"></span>
+  <div class="header-left">
+    <span class="header-title">Bloop History</span>
+    <span class="header-count" id="count"></span>
+  </div>
+  <div class="header-right">
+    <span class="settings-live" id="settings-live"></span>
+    <button class="btn-clear" id="clear-all" title="Delete all history rows">Clear all</button>
+    <button class="settings-toggle" id="settings-toggle" title="Settings" aria-expanded="false">⚙</button>
+  </div>
+</div>
+
+<div class="settings is-collapsed" id="settings-panel">
+  <div class="settings-head">
+    <span class="settings-title">Settings</span>
+    <span class="settings-status" id="settings-status"></span>
+  </div>
+  <div class="settings-grid">
+    <div class="field full">
+      <label for="s-model">Model</label>
+      <select id="s-model">
+        <option value="mlx-community/whisper-tiny-mlx">Tiny - fastest, lowest accuracy</option>
+        <option value="mlx-community/whisper-small-mlx">Small - fast, good accuracy</option>
+        <option value="mlx-community/whisper-medium-mlx">Medium - slower, better accuracy</option>
+        <option value="mlx-community/whisper-large-v3-mlx">Large v3 - slowest, best accuracy</option>
+      </select>
+    </div>
+
+    <div class="field">
+      <label for="s-hotkey">Push-to-talk key</label>
+      <select id="s-hotkey">
+        <option value="right_cmd">Right Cmd</option>
+        <option value="right_option">Right Option</option>
+        <option value="right_shift">Right Shift</option>
+      </select>
+    </div>
+
+    <div class="field">
+      <label for="s-silence">Silence trim</label>
+      <select id="s-silence">
+        <option value="off">Off</option>
+        <option value="normal">Normal</option>
+        <option value="aggressive">Aggressive</option>
+      </select>
+    </div>
+
+    <div class="field">
+      <label>Auto-paste</label>
+      <div class="check-row">
+        <input type="checkbox" id="s-auto-paste">
+        <span>Paste after transcript</span>
+      </div>
+    </div>
+
+    <div class="field">
+      <label>Chunking (latch mode)</label>
+      <div class="check-row">
+        <input type="checkbox" id="s-latch-mode">
+        <span>Enable chunking</span>
+      </div>
+    </div>
+
+    <div class="field full">
+      <label for="s-chunk-sec">Chunk seconds</label>
+      <input id="s-chunk-sec" type="number" min="2" max="60" step="1" value="10">
+    </div>
+
+    <div class="field">
+      <label>Recording pill</label>
+      <div class="check-row">
+        <input type="checkbox" id="s-pill">
+        <span>Show pill (relaunch to apply)</span>
+      </div>
+    </div>
+
+    <div class="field">
+      <label for="s-pillstyle">Pill style (relaunch to apply)</label>
+      <select id="s-pillstyle">
+        <option value="bubbles">Bubbles &mdash; the namesake</option>
+        <option value="spectrogram">Spectrogram &mdash; NOAA trace</option>
+      </select>
+    </div>
+
+    <div class="field full">
+      <label for="s-vocab">Custom vocabulary &mdash; one word or phrase per line</label>
+      <textarea id="s-vocab" rows="4" spellcheck="false" placeholder="Blooop&#10;Acme Widget"></textarea>
+    </div>
+  </div>
+  <div class="settings-hint">Hotkey changes apply live. Model changes download in background and apply after relaunch.</div>
+  <div class="settings-runtime" id="settings-runtime-wrap">
+    <span class="runtime-spinner" id="runtime-spinner"></span>
+    <span id="settings-runtime"></span>
+  </div>
 </div>
 
 <div class="cards" id="cards"></div>
 
 <script>
 const COLORS = {
-  ok:        '#3fb950',
-  recording: '#58a6ff',
-  no_speech: '#d29922',
-  no_audio:  '#6e7681',
-  too_short: '#6e7681',
-  error:     '#f85149',
+  ok:        '#3ad6a5',
+  recording: '#6fd8ff',
+  no_speech: '#c9b79b',
+  no_audio:  '#5d7488',
+  too_short: '#5d7488',
+  error:     '#ff7e6b',
 };
 const LABELS = {
   ok:        'ok',
@@ -350,6 +954,181 @@ const LABELS = {
 };
 
 const expanded = new Set();
+let settingsLoaded = false;
+let settingsSaveTimer = null;
+
+function setSettingsStatus(msg, isError=false) {
+  const el = document.getElementById('settings-status');
+  const live = document.getElementById('settings-live');
+  if (!el) return;
+  el.textContent = msg || '';
+  if (live) live.textContent = msg || '';
+  el.style.color = isError ? 'var(--red)' : 'var(--fg-muted)';
+  if (live) live.style.color = isError ? 'var(--red)' : 'var(--fg-faint)';
+}
+
+function setRuntimeStatus(msg, isError=false, busy=false) {
+  const wrap = document.getElementById('settings-runtime-wrap');
+  const el = document.getElementById('settings-runtime');
+  const spin = document.getElementById('runtime-spinner');
+  if (!el || !wrap || !spin) return;
+  el.textContent = msg || '';
+  wrap.classList.toggle('is-error', !!isError);
+  spin.classList.toggle('is-active', !!busy);
+}
+
+function summarizeRuntimeStatus(s) {
+  if (!s || typeof s !== 'object') return { msg: '', isError: false, busy: false };
+  const runtime = (s.runtime_model || '').trim();
+  const requested = (s.requested_model || runtime).trim();
+  const state = (s.model_download_state || 'idle').trim();
+  const target = (s.model_download_target || requested || '').trim();
+  const error = (s.model_download_error || '').trim();
+
+  if (!runtime) return { msg: '', isError: false, busy: false };
+  if (state === 'downloading' && target) {
+    return { msg: `Downloading model: ${target} (using ${runtime})`, isError: false, busy: true };
+  }
+  if (state === 'queued' && target) {
+    return { msg: `Queued model download: ${target} (using ${runtime})`, isError: false, busy: true };
+  }
+  if (state === 'downloaded' && target) {
+    return { msg: `Model downloaded: ${target}. Relaunch Blooop to switch.`, isError: false, busy: false };
+  }
+  if (state === 'failed') {
+    const detail = error || target || 'unknown error';
+    return { msg: `Model download failed: ${detail}`, isError: true, busy: false };
+  }
+  if (requested && requested !== runtime) {
+    return { msg: `Using ${runtime}. Next after relaunch: ${requested}`, isError: false, busy: false };
+  }
+  return { msg: `Using model: ${runtime}`, isError: false, busy: false };
+}
+
+async function refreshRuntimeStatus() {
+  try {
+    const raw = await window.pywebview.api.get_runtime_status();
+    const info = summarizeRuntimeStatus(JSON.parse(raw || '{}'));
+    setRuntimeStatus(info.msg, info.isError, info.busy);
+  } catch (_) { /* bridge not ready yet */ }
+}
+
+function setSettingsOpen(open) {
+  const panel = document.getElementById('settings-panel');
+  const btn = document.getElementById('settings-toggle');
+  if (!panel || !btn) return;
+  panel.classList.toggle('is-collapsed', !open);
+  btn.classList.toggle('is-open', !!open);
+  btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+  try {
+    localStorage.setItem('bloop_history_settings_open', open ? '1' : '0');
+  } catch (_) {}
+}
+
+function toggleSettingsPanel() {
+  const panel = document.getElementById('settings-panel');
+  if (!panel) return;
+  setSettingsOpen(panel.classList.contains('is-collapsed'));
+}
+
+function restoreSettingsOpenState() {
+  let open = false;
+  try {
+    open = localStorage.getItem('bloop_history_settings_open') === '1';
+  } catch (_) {}
+  setSettingsOpen(open);
+}
+
+function updateChunkControlState() {
+  const enabled = document.getElementById('s-latch-mode').checked;
+  document.getElementById('s-chunk-sec').disabled = !enabled;
+}
+
+function readSettingsForm() {
+  let sec = parseFloat(document.getElementById('s-chunk-sec').value || '10');
+  if (!Number.isFinite(sec)) sec = 10;
+  sec = Math.max(2, Math.min(60, sec));
+  return {
+    model: document.getElementById('s-model').value,
+    hotkey: document.getElementById('s-hotkey').value,
+    silence_trim_preset: document.getElementById('s-silence').value,
+    auto_paste: !!document.getElementById('s-auto-paste').checked,
+    latch_chunk_mode: !!document.getElementById('s-latch-mode').checked,
+    latch_chunk_seconds: sec,
+    pill_window: !!document.getElementById('s-pill').checked,
+    pill_style: document.getElementById('s-pillstyle').value,
+    custom_vocab: document.getElementById('s-vocab').value,
+  };
+}
+
+function applySettingsForm(s) {
+  if (!s) return;
+  const modelSel = document.getElementById('s-model');
+  if ([...modelSel.options].some(o => o.value === s.model)) {
+    modelSel.value = s.model;
+  }
+  const hotSel = document.getElementById('s-hotkey');
+  if ([...hotSel.options].some(o => o.value === s.hotkey)) {
+    hotSel.value = s.hotkey;
+  }
+  const silSel = document.getElementById('s-silence');
+  if ([...silSel.options].some(o => o.value === s.silence_trim_preset)) {
+    silSel.value = s.silence_trim_preset;
+  }
+  document.getElementById('s-auto-paste').checked = !!s.auto_paste;
+  document.getElementById('s-latch-mode').checked = !!s.latch_chunk_mode;
+  if (s.latch_chunk_seconds != null) {
+    document.getElementById('s-chunk-sec').value = String(Math.round(s.latch_chunk_seconds));
+  }
+  document.getElementById('s-pill').checked = s.pill_window !== false;
+  const styleSel = document.getElementById('s-pillstyle');
+  if ([...styleSel.options].some(o => o.value === s.pill_style)) {
+    styleSel.value = s.pill_style;
+  }
+  const vocabEl = document.getElementById('s-vocab');
+  // Don't rewrite the textarea mid-typing — the normalized form would yank
+  // the cursor. It refreshes on next panel load / focus elsewhere.
+  if (vocabEl && document.activeElement !== vocabEl) {
+    vocabEl.value = Array.isArray(s.custom_vocab)
+      ? s.custom_vocab.join('\\n')
+      : String(s.custom_vocab || '');
+  }
+  updateChunkControlState();
+}
+
+async function saveSettingsNow() {
+  if (!settingsLoaded) return;
+  const payload = readSettingsForm();
+  setSettingsStatus('Saving…');
+  try {
+    const raw = await window.pywebview.api.save_settings(JSON.stringify(payload));
+    const saved = JSON.parse(raw);
+    applySettingsForm(saved);
+    setSettingsStatus('Saved');
+    setTimeout(() => setSettingsStatus(''), 1200);
+  } catch (_) {
+    setSettingsStatus('Save failed', true);
+  }
+}
+
+function scheduleSettingsSave() {
+  if (!settingsLoaded) return;
+  updateChunkControlState();
+  setSettingsStatus('Pending…');
+  if (settingsSaveTimer) clearTimeout(settingsSaveTimer);
+  settingsSaveTimer = setTimeout(saveSettingsNow, 220);
+}
+
+async function loadSettings() {
+  try {
+    const raw = await window.pywebview.api.get_settings();
+    applySettingsForm(JSON.parse(raw));
+    settingsLoaded = true;
+    setSettingsStatus('');
+  } catch (_) {
+    setSettingsStatus('Settings unavailable', true);
+  }
+}
 
 function fmtTs(iso) {
   const d = new Date(iso.endsWith('Z') ? iso : iso + 'Z');
@@ -412,7 +1191,7 @@ function buildCard(r) {
     : '';
 
   return `
-<div class="card" id="card-${r.id}">
+<div class="card" id="card-${r.id}" data-st="${r.status}">
   <div class="card-accent" style="background:${col}"></div>
   <div class="card-body">
     <div class="card-meta">
@@ -448,7 +1227,10 @@ function renderAll(rows) {
     return;
   }
 
-  const sig = rows.map(r => `${r.id}:${r.status}:${r.text.length}`).join('|');
+  // Include a 30s time bucket so relative timestamps ("2m ago") keep moving
+  // even when the rows themselves haven't changed.
+  const sig = rows.map(r => `${r.id}:${r.status}:${r.text.length}`).join('|')
+            + '@' + Math.floor(Date.now() / 30000);
   if (sig === lastSig) return;
   lastSig = sig;
 
@@ -486,6 +1268,31 @@ function deleteRow(id) {
   });
 }
 
+let clearArmTimer = null;
+function setupClearAll() {
+  const btn = document.getElementById('clear-all');
+  if (!btn) return;
+  btn.addEventListener('click', async () => {
+    if (!btn.classList.contains('is-armed')) {
+      // Two-step confirm: first click arms, second click (within 2.6s) clears.
+      btn.classList.add('is-armed');
+      btn.textContent = 'Really clear?';
+      clearArmTimer = setTimeout(() => {
+        btn.classList.remove('is-armed');
+        btn.textContent = 'Clear all';
+      }, 2600);
+      return;
+    }
+    if (clearArmTimer) clearTimeout(clearArmTimer);
+    btn.classList.remove('is-armed');
+    btn.textContent = 'Clear all';
+    try { await window.pywebview.api.clear_history(); } catch (_) {}
+    expanded.clear();
+    lastSig = null;
+    refresh();
+  });
+}
+
 async function refresh() {
   try {
     const raw  = await window.pywebview.api.get_history();
@@ -494,8 +1301,63 @@ async function refresh() {
   } catch (_) { /* bridge not ready yet */ }
 }
 
-window.addEventListener('pywebviewready', refresh);
-setInterval(refresh, 2000);
+let lastRaiseSeq = null;
+let lastSettingsSeq = null;
+async function pollCommands() {
+  try {
+    const raw = await window.pywebview.api.get_command_state();
+    const cmd = JSON.parse(raw || '{}');
+    const r = Number(cmd.raise_seq || 0);
+    const s = Number(cmd.settings_seq || 0);
+    if (lastRaiseSeq === null) lastRaiseSeq = r;
+    if (lastSettingsSeq === null) lastSettingsSeq = s;
+    if (r > lastRaiseSeq) {
+      lastRaiseSeq = r;
+      try { window.pywebview.api.activate_window(); } catch (_) {}
+      try { window.focus(); } catch (_) {}
+    }
+    if (s > lastSettingsSeq) {
+      lastSettingsSeq = s;
+      setSettingsOpen(true);
+    }
+  } catch (_) { /* bridge not ready yet */ }
+}
+
+async function tick() {
+  await refresh();
+  await refreshRuntimeStatus();
+}
+
+function initSettingsBindings() {
+  const btn = document.getElementById('settings-toggle');
+  if (btn) btn.addEventListener('click', toggleSettingsPanel);
+
+  const ids = ['s-model', 's-hotkey', 's-silence', 's-auto-paste', 's-latch-mode',
+               's-chunk-sec', 's-pill', 's-pillstyle', 's-vocab'];
+  ids.forEach((id) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const evt = (id === 's-chunk-sec' || id === 's-vocab') ? 'input' : 'change';
+    el.addEventListener(evt, scheduleSettingsSave);
+  });
+
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape') setSettingsOpen(false);
+  });
+}
+
+window.addEventListener('pywebviewready', async () => {
+  restoreSettingsOpenState();
+  initSettingsBindings();
+  setupClearAll();
+  await loadSettings();
+  await tick();
+  await pollCommands();
+});
+setInterval(tick, 2000);
+// Commands (raise window / open settings from the menu bar) poll faster than
+// the data tick so menu clicks feel immediate instead of up-to-2s laggy.
+setInterval(pollCommands, 500);
 </script>
 </body>
 </html>"""
@@ -503,8 +1365,11 @@ setInterval(refresh, 2000);
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
+def run_history_ui():
+    _set_process_program_name("Blooop History")
+    _force_macos_ui_element()
     _set_macos_accessory_app()
+    threading.Thread(target=_watch_parent_and_exit, daemon=True).start()
     try:
         import webview
     except ImportError:
@@ -515,11 +1380,22 @@ if __name__ == "__main__":
     window = webview.create_window(
         "Bloop History",
         html=HTML,
-        width=420,
+        width=460,
         height=720,
         resizable=True,
-        min_size=(320, 400),
-        background_color="#0d1117",
+        min_size=(360, 400),
+        background_color="#0a121c",
         js_api=api,
     )
-    webview.start()
+
+    def _on_start():
+        # Some GUI backends can reset activation policy during startup.
+        _set_process_program_name("Blooop History")
+        _force_macos_ui_element()
+        _set_macos_accessory_app()
+
+    webview.start(_on_start)
+
+
+if __name__ == "__main__":
+    run_history_ui()

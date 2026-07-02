@@ -1,0 +1,29 @@
+{
+  "name": "blooop",
+  "version": "0.1.0",
+  "description": "Blooop CLI wrapper for macOS Apple Silicon runtime",
+  "license": "MIT",
+  "type": "commonjs",
+  "bin": {
+    "blooop": "bin/blooop.js",
+    "bloop": "bin/blooop.js"
+  },
+  "files": [
+    "bin"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "blooop",
+    "bloop",
+    "whisper",
+    "transcription",
+    "cli"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rumblelab/blooop.git",
+    "directory": "packages/blooop-wrapper"
+  }
+}

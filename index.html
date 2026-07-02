@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Blooop lab · round four — bioluminescent, refined</title>
+<style>
+:root{ --bg:#101216; --line:#262b34; --txt:#d6dae2; --mut:#7d8590; --acc:#6fd8ff }
+*{box-sizing:border-box; margin:0; padding:0}
+body{ background:var(--bg); color:var(--txt); font:15px/1.6 -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif; padding-bottom:8rem }
+header{ max-width:1240px; margin:0 auto; padding:3rem 1.5rem 1.6rem }
+h1{ font-size:1.7rem; font-weight:600; letter-spacing:-.02em }
+h1 span{ color:var(--acc) }
+.sub{ color:var(--mut); margin-top:.3rem }
+main{ max-width:1240px; margin:0 auto; padding:0 1.5rem; display:grid; grid-template-columns:repeat(auto-fill,minmax(420px,1fr)); gap:2.8rem 2.2rem }
+figure{ display:flex; flex-direction:column; gap:.7rem }
+.cap{ display:flex; align-items:baseline; gap:.6rem }
+.no{ color:var(--acc); font-size:.85rem }
+.nm{ font-weight:600; font-size:1.05rem }
+.desc{ color:var(--mut); font-size:.92rem }
+.frame{ position:relative; height:560px; border:1px solid var(--line); border-radius:12px; overflow:hidden; cursor:default }
+.titlebar{ position:absolute; top:0; left:0; right:0; height:26px; display:flex; align-items:center; gap:6px; padding:0 10px; z-index:9 }
+.titlebar i{ width:10px; height:10px; border-radius:50%; background:#2c333b }
+
+.mock{ position:absolute; inset:26px 0 0; padding:16px 14px; overflow:hidden; display:flex; flex-direction:column; z-index:5 }
+.mhead{ display:flex; align-items:baseline; gap:8px; margin-bottom:12px }
+.mtitle{ font-weight:600; font-size:13.5px; letter-spacing:.01em }
+.mcount{ font-size:11px; opacity:.45 }
+.mgear{ margin-left:auto; font-size:13px; opacity:.5 }
+.mlist{ display:flex; flex-direction:column; min-height:0 }
+.entry{ position:relative; transition:opacity .45s ease, filter .45s ease }
+.emeta{ display:flex; align-items:center; gap:7px; font-size:10.5px }
+.edot{ width:6px; height:6px; border-radius:50%; flex:0 0 auto }
+.estat{ font-weight:600 }
+.echips{ margin-left:auto; opacity:.5; white-space:nowrap }
+.etext{ font-size:12.5px; line-height:1.6; margin-top:4px }
+.etext.muted{ opacity:.5; font-style:italic }
+.eacts{ display:flex; gap:6px; margin-top:8px; opacity:0; transition:opacity .25s }
+.entry:hover .eacts{ opacity:1 }
+.eacts button{ font:10.5px -apple-system,sans-serif; padding:3px 10px; cursor:pointer; border-radius:7px; border:1px solid transparent }
+
+.s-ok .edot{ background:#37e0a0; box-shadow:0 0 7px rgba(55,224,160,.7) }
+.s-ok .estat{ color:#37e0a0 }
+.s-recording .edot{ background:#6fd8ff; box-shadow:0 0 8px rgba(111,216,255,.9); animation:pulse 1.6s ease-in-out infinite }
+.s-recording .estat{ color:#6fd8ff }
+.s-no_speech .edot{ background:#8a93a3; box-shadow:none }
+.s-no_speech .estat{ color:#8a93a3 }
+@keyframes pulse{ 0%,100%{ transform:scale(.85); opacity:.7 } 50%{ transform:scale(1.15); opacity:1 } }
+
+/* ══ 01 LANTERN — editorial cards, cursor rim-light ══ */
+.v-lantern{ background:#05080d }
+.v-lantern .mock{ color:#c4d2dc }
+.v-lantern .entry{ background:#070c13; border:1px solid rgba(111,180,220, calc(.07 + var(--prox,0)*.45));
+  border-radius:12px; padding:11px 13px; margin-bottom:9px }
+.v-lantern .entry::after{ content:""; position:absolute; inset:0; border-radius:12px; pointer-events:none;
+  background:radial-gradient(150px circle at var(--lx,50%) var(--ly,120%), rgba(111,216,255,.07), transparent 70%) }
+.v-lantern .etext{ color:#dfe9f0 }
+.v-lantern .eacts button{ background:rgba(111,216,255,.07); color:#9fd0e8; border-color:rgba(111,216,255,.15) }
+
+/* ══ 02 DESCENT — no cards; time is depth, cursor is the lantern ══ */
+.v-descent{ background:linear-gradient(180deg,#071019 0%,#04090f 40%,#01040a 100%) }
+.v-descent .mock{ color:#cfe0ea; padding-left:18px; padding-right:18px }
+.v-descent .entry{ padding:12px 4px 13px 56px; opacity:calc(1 - var(--depth,0)*.62); }
+.v-descent .entry:hover{ opacity:1 }
+.v-descent .entry + .entry{ border-top:1px solid rgba(111,180,220, calc(.06 + var(--prox,0)*.3)) }
+.v-descent .etime{ position:absolute; left:2px; top:14px; font:10px ui-monospace, Menlo, monospace;
+  color:#54748a; width:48px }
+.v-descent .emeta .echips{ display:none }
+.v-descent .etext{ font-size:13px }
+.v-descent .eacts button{ background:transparent; color:#7fb8d4; border-color:rgba(111,180,220,.2) }
+.v-descent .fathom{ position:absolute; right:10px; bottom:8px; font:9.5px ui-monospace,monospace; color:#2c4356; letter-spacing:.1em; z-index:6 }
+
+/* ══ 03 DISTURBANCE — one shared light in the water itself ══ */
+.v-disturb{ background:#04070c }
+.v-disturb .light{ position:absolute; inset:0; z-index:2; pointer-events:none;
+  background:radial-gradient(190px circle at var(--gx,50%) var(--gy,110%), rgba(60,150,200,.13), rgba(60,150,200,.04) 45%, transparent 70%) }
+.v-disturb .mock{ color:#bfd2de }
+.v-disturb .entry{ border-radius:11px; padding:11px 12px; margin-bottom:8px;
+  background:rgba(10,20,30, calc(.45 + var(--prox,0)*.4));
+  border:1px solid rgba(95,170,215, calc(.05 + var(--prox,0)*.5)) }
+.v-disturb .etext{ color:rgba(226,240,248, calc(.62 + var(--prox,0)*.38)) }
+.v-disturb .fleck{ position:absolute; width:2px; height:2px; border-radius:50%; background:#4a8ab0; z-index:1; animation:fleck 5s ease-in-out infinite; opacity:0 }
+@keyframes fleck{ 0%,86%,100%{opacity:0} 90%{opacity:.5} 94%{opacity:.2} }
+.v-disturb .eacts button{ background:rgba(95,170,215,.1); color:#a8d2e8; border-color:transparent }
+
+/* ══ 04 BEACON — descent + the live recording as the one bright thing ══ */
+.v-beacon{ background:linear-gradient(180deg,#061220 0%,#040b14 45%,#02060c 100%) }
+.v-beacon .mock{ color:#c8dae6 }
+.v-beacon .entry{ border-radius:12px; padding:11px 13px; margin-bottom:9px;
+  background:rgba(8,18,28,.5); border:1px solid rgba(111,180,220, calc(.06 + var(--prox,0)*.35));
+  opacity:calc(1 - var(--depth,0)*.55) }
+.v-beacon .entry:hover{ opacity:1 }
+.v-beacon .entry.s-recording{ opacity:1; background:linear-gradient(170deg, rgba(15,46,66,.85), rgba(8,26,40,.85));
+  border-color:rgba(111,216,255,.4); box-shadow:0 0 26px rgba(54,150,200,.18) }
+.v-beacon .entry.s-recording::before{ content:""; position:absolute; left:14px; top:15px; width:6px; height:6px; border-radius:50%;
+  border:1px solid rgba(111,216,255,.7); animation:ring 2s ease-out infinite }
+@keyframes ring{ 0%{ transform:scale(1); opacity:.8 } 100%{ transform:scale(3.4); opacity:0 } }
+.v-beacon .eacts button{ background:rgba(111,216,255,.08); color:#9fd0e8; border-color:rgba(111,216,255,.14) }
+
+footer{ text-align:center; color:var(--mut); margin-top:4rem; font-size:.9rem }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Round four — <span>bioluminescent, refined</span></h1>
+  <div class="sub">one signature move each, no costumes · move your cursor through them — the light is real and ships as-is in the webview panel</div>
+</header>
+
+<main id="grid"></main>
+
+<footer>02 Descent is the concept pick: memory sinks, your cursor is the lantern · all type, spacing, and glow shown here transfer 1:1 to history_ui.py</footer>
+
+<script>
+const ENTRIES = [
+  {s:'recording', label:'recording', time:'now', chips:'just now', text:'', muted:'Listening…'},
+  {s:'ok', label:'saved', time:'2m', chips:'2m ago · Claude · 14.2s', text:'Alright, let\'s test it out. Oh, we got our bubbles. We\'re blooping, baby. I really like it.'},
+  {s:'ok', label:'saved', time:'18m', chips:'18m ago · Mail · 31.0s', text:'The history panel could use a refresh — it shouldn\'t feel like a terminal bolted onto a bubble.'},
+  {s:'no_speech', label:'no speech', time:'1h', chips:'1h ago · Terminal · 2.1s', text:'', muted:'No speech detected.'},
+  {s:'ok', label:'saved', time:'3h', chips:'3h ago · Claude · 58.4s', text:'I want it to be remarkable, but not too over the top. One good idea, executed quietly.'},
+  {s:'ok', label:'saved', time:'1d', chips:'yesterday · Notes · 12.9s', text:'Older words sink. The cursor is a lantern. Hover the deep to bring a memory back up.'},
+];
+
+const VARIANTS = [
+  ['v-lantern','Lantern','Editorial cards on near-black. The only effect: a soft rim of light on whatever your cursor approaches.'],
+  ['v-descent','Descent','No cards at all. Newest words at the surface; older ones sink into the dark — hover re-illuminates them. Time runs downward like a dive profile.'],
+  ['v-disturb','Disturbance','The light lives in the water, not the cards: one glow follows your cursor through the panel, and entries brighten as it passes. Rare flecks blink far off.'],
+  ['v-beacon','Beacon','Descent\'s fade plus one bright thing: the live recording glows with a slow sonar ring while everything settled rests in the dark.'],
+];
+
+function entryHTML(e, v){
+  const body = e.text ? `<div class="etext">${e.text}</div>` : `<div class="etext muted">${e.muted}</div>`;
+  const acts = e.text ? `<div class="eacts"><button>Copy</button><button>Delete</button></div>` : '';
+  const time = v === 'v-descent' ? `<span class="etime">${e.time}</span>` : '';
+  return `<div class="entry s-${e.s}">${time}
+    <div class="emeta"><span class="edot"></span><span class="estat">${e.label}</span><span class="echips">${e.chips}</span></div>
+    ${body}${acts}</div>`;
+}
+
+function decorations(v){
+  if (v === 'v-disturb'){
+    let f = '<div class="light"></div>';
+    for (let i = 0; i < 7; i++)
+      f += `<i class="fleck" style="left:${Math.random()*94}%; top:${Math.random()*92}%; animation-delay:${-Math.random()*5}s"></i>`;
+    return f;
+  }
+  if (v === 'v-descent') return `<div class="fathom">— deeper —</div>`;
+  return '';
+}
+
+document.getElementById('grid').innerHTML = VARIANTS.map(([v, name, desc], idx) => `
+<figure>
+  <div class="frame ${v}" data-v="${v}">
+    ${decorations(v)}
+    <div class="titlebar"><i></i><i></i><i></i></div>
+    <div class="mock">
+      <div class="mhead"><span class="mtitle">Bloop History</span><span class="mcount">42 items</span><span class="mgear">⚙</span></div>
+      <div class="mlist">${ENTRIES.map(e => entryHTML(e, v)).join('')}</div>
+    </div>
+  </div>
+  <figcaption class="cap"><span class="no">0${idx+1}</span><span class="nm">${name}</span></figcaption>
+  <div class="desc">${desc}</div>
+</figure>`).join('');
+
+// depth fade indices
+document.querySelectorAll('.v-descent .entry, .v-beacon .entry').forEach((el, i, all) => {
+  const n = 6; // per-frame entry count
+  el.style.setProperty('--depth', ((i % n) / (n - 1)).toFixed(3));
+});
+
+// cursor light: per-frame, set per-entry proximity + local light coords
+document.querySelectorAll('.frame').forEach(frame => {
+  let raf = null;
+  frame.addEventListener('mousemove', ev => {
+    if (raf) return;
+    raf = requestAnimationFrame(() => {
+      raf = null;
+      const fr = frame.getBoundingClientRect();
+      frame.style.setProperty('--gx', ((ev.clientX - fr.left) / fr.width * 100).toFixed(1) + '%');
+      frame.style.setProperty('--gy', ((ev.clientY - fr.top) / fr.height * 100).toFixed(1) + '%');
+      frame.querySelectorAll('.entry').forEach(el => {
+        const r = el.getBoundingClientRect();
+        const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+        const d = Math.hypot(ev.clientX - cx, ev.clientY - cy);
+        el.style.setProperty('--prox', Math.max(0, 1 - d / 260).toFixed(3));
+        el.style.setProperty('--lx', (ev.clientX - r.left) + 'px');
+        el.style.setProperty('--ly', (ev.clientY - r.top) + 'px');
+      });
+    });
+  });
+  frame.addEventListener('mouseleave', () => {
+    frame.querySelectorAll('.entry').forEach(el => el.style.setProperty('--prox', 0));
+  });
+});
+</script>
+</body>
+</html>

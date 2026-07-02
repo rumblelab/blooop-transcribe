@@ -1,153 +1,161 @@
-# bloop_flow
+# blooop
 
-`bloop_flow` is the first tool in the broader **Bloop** toolkit.
+**Local push-to-talk voice for AI. Mac only. Apple Silicon. Open source.**
 
-Planned sibling tools:
-- `bloop_flow`: local voice-to-text + auto-paste (this project)
-- `bloop_ding`: terminal completion/attention notifier (planned)
-- `bloop.lol`: product/landing site that links all tools
+Hold right-Command, talk, release. Your words get transcribed locally via [MLX Whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper) and pasted into whatever app is focused. Claude Code, ChatGPT, Cursor, your terminal, a Google Doc -- doesn't matter. If you can paste into it, blooop works with it.
 
-Repository scaffolding for those siblings lives in:
-- `apps/bloop-ding/`
-- `web/bloop-lol/`
+No cloud. No subscription. No account. Your voice never leaves your machine.
 
-Local, free, offline voice-to-text for Apple Silicon Macs. No subscription, no cloud, no data leaving your machine.
-
-Transcribes using [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper) — Whisper running natively on the M-series GPU via Apple's MLX framework. Pastes the result wherever your cursor is.
+**[blooop.lol](https://blooop.lol)**
 
 ---
 
-## Requirements
+## What it looks like
 
-- **Mac with Apple Silicon** (M1 / M2 / M3 or later)
-- **macOS 13 Ventura or later**
-- **Python 3.10+** — check with `python3 --version`
+```
+$ blooop
 
----
+────────────────────────────────────────
+  blooop  v0.1  |  model: whisper-small-mlx
+────────────────────────────────────────
+
+  Hold Right Cmd     push-to-talk
+  Double-tap         latch mode (hands-free)
+  Tap                stop + unlatch
+  Ctrl-C             quit
+
+  Listening…
+
+  [Recording]  ██████████████░░  3.2s
+  Transcribing…
+  "Can you refactor the auth middleware to use JWT instead of sessions"
+  Pasted.
+```
 
 ## Install
 
-**With Claude Code (easiest):**
 ```bash
-git clone https://github.com/yourname/bloop_flow
-cd bloop_flow
-claude
-```
-Then ask: *"Set this up and get it running for me"* — it'll handle the rest.
-
-**Manual:**
-```bash
-git clone https://github.com/yourname/bloop_flow
-cd bloop_flow
+git clone https://github.com/rumblelab/blooop
+cd blooop
 ./setup.sh
+source ~/.zshrc   # or open a new terminal tab
+blooop
 ```
 
-`setup.sh` will:
-- Create an isolated Python venv
-- Install all dependencies
-- Download the Whisper model (~250 MB, cached after first download)
-- Open System Settings so you can grant the two required permissions
+That's it. `setup.sh` creates an isolated venv, installs deps, downloads the Whisper model (~250 MB), drops a `blooop` command in your PATH, and opens the macOS permission panels you need to approve.
 
----
+## Requirements
+
+- macOS 13+ (Ventura or later)
+- Apple Silicon (M1 / M2 / M3 / M4)
+- Python 3.10+
+- ffmpeg (`brew install ffmpeg`)
 
 ## Permissions
 
-bloop needs two permissions granted for your terminal app (Terminal, iTerm2, Warp, etc.):
+Blooop needs two macOS permissions, both granted to your **terminal app** (Terminal, iTerm, Kitty, etc.):
 
 | Permission | Why |
 |---|---|
 | **Microphone** | To record your voice |
 | **Accessibility** | To listen for the global hotkey from any app |
 
-`setup.sh` opens both settings panels automatically. If you skipped that step:
-
-- **System Settings → Privacy & Security → Microphone**
-- **System Settings → Privacy & Security → Accessibility**
-
----
-
-## Run
-
-```bash
-./run.sh
-```
-
-Or if you set up the alias during install:
-
-```bash
-bloop
-```
-
----
+System Settings -> Privacy & Security -> Microphone + Accessibility. `setup.sh` opens both panels for you.
 
 ## Usage
 
 | Action | Hotkey |
 |---|---|
-| **Push-to-talk** | Hold `Right ⌘` → speak → release |
-| **Latch mode on** | Double-tap `Right ⌘` (hands-free, keeps recording) |
-| **Latch mode off** | Tap `Right ⌘` once |
-| **Quit** | `Ctrl-C` in the terminal |
+| **Push-to-talk** | Hold `Right Cmd` -> speak -> release |
+| **Latch mode** | Double-tap `Right Cmd` (hands-free, keeps recording) |
+| **Stop latch** | Tap `Right Cmd` once |
+| **Quit** | `Ctrl-C` |
 
-After transcription, the text is automatically copied to your clipboard and pasted into whatever app was focused when you started speaking.
+Text gets copied to your clipboard and auto-pasted into the focused app. Some Electron apps block programmatic paste -- just hit `Cmd-V` manually.
 
-A small **waveform pill** appears near the Dock while recording.
-A **history window** shows your recent transcriptions — you can copy or delete individual entries.
+## Works with
 
----
+Anything you can paste into:
+
+- Claude Code / Claude.ai
+- ChatGPT
+- Cursor / Windsurf / VS Code
+- Terminal (for shell commands)
+- Notion, Google Docs, Slack, email
+- Literally anything with a text field
 
 ## Config
 
-Open `bloop.py` and edit the values at the top:
+Edit the top of `bloop.py`:
 
 ```python
-# Model — trade speed for accuracy
 MODEL = "mlx-community/whisper-small-mlx"   # default (~250 MB)
-# Faster / smaller  →  mlx-community/whisper-tiny-mlx   (~39 MB)
-# Higher accuracy   →  mlx-community/whisper-medium-mlx (~770 MB)
-# Best quality      →  mlx-community/whisper-large-v3-mlx (~3 GB)
+# Faster  -> mlx-community/whisper-tiny-mlx   (~39 MB)
+# Better  -> mlx-community/whisper-medium-mlx (~770 MB)
+# Best    -> mlx-community/whisper-large-v3-mlx (~3 GB)
 
-# Paste automatically after transcription
 AUTO_PASTE = True
-
-# Latch mode: transcribe in rolling chunks (avoids one huge clip)
 LATCH_CHUNK_SECONDS = 10.0
 ```
-
----
-
-## Troubleshooting
-
-**Nothing happens when I hold Right ⌘**
-→ Accessibility permission is missing or wasn't granted to the right terminal app. Check System Settings → Privacy & Security → Accessibility.
-
-**Microphone permission prompt never appeared**
-→ Go to System Settings → Privacy & Security → Microphone and enable your terminal manually.
-
-**Auto-paste doesn't work in my app**
-→ Some apps (browsers, Electron apps) block programmatic paste. The text is always on your clipboard — just paste manually with `⌘V`.
-
-**First transcription is slow**
-→ The model loads on first use and stays warm. Subsequent transcriptions are fast.
-
-**I want a different model**
-→ Edit `MODEL` in `bloop.py`. Run `./setup.sh` again to pre-download the new model.
-
----
 
 ## How it works
 
 ```
-Hold key → record audio (sounddevice)
-Release  → write WAV to temp file
-         → mlx-whisper transcribes on M-series GPU
-         → copy text to clipboard
-         → osascript pastes into focused app
+Hold key  ->  record audio (sounddevice)
+Release   ->  write WAV to temp file
+          ->  mlx-whisper transcribes on Apple GPU
+          ->  copy text to clipboard
+          ->  osascript pastes into focused app
 ```
 
-Everything runs locally. No API keys, no internet required after the model is downloaded.
+Everything runs locally. No API keys, no internet after the model downloads.
 
----
+## Why not Whispr?
+
+Sure, you could download Whispr Flow and spend $15/month sending your voice to someone else's servers. But you won't. Because you're smart. And cheap. And you don't trust the cloud with your half-formed thoughts about refactoring the auth layer.
+
+blooop is the open-source alternative. Same idea, zero dollars, fully private.
+
+## Troubleshooting
+
+**Nothing happens when I hold Right Cmd**
+- Accessibility permission is missing. Check System Settings -> Privacy & Security -> Accessibility. Enable your terminal app.
+
+**Microphone permission prompt never appeared**
+- Launch blooop and try recording once, then check System Settings -> Privacy & Security -> Microphone.
+
+**`command not found: blooop`**
+- Run `source ~/.zshrc` (or open a new terminal tab). Then `type -a blooop` to verify.
+
+**Auto-paste doesn't work in my app**
+- The text is always on your clipboard. Just `Cmd-V`.
+
+**First transcription is slow**
+- The model loads on first use. Subsequent ones are fast.
+
+**ffmpeg not found**
+- `brew install ffmpeg`
+
+## Companion tools
+
+- **[blooop ding](https://github.com/rumblelab/blooop-ding)** -- terminal notifier that bloops when your AI agent needs attention (planned)
+- **[blooop.lol](https://blooop.lol)** -- the website, such as it is
+
+## npm wrapper
+
+If you prefer npm:
+
+```bash
+npm install -g blooop
+```
+
+This is a thin launcher that delegates to the Python CLI. You still need `setup.sh` for the actual runtime.
+
+## Star this repo
+
+If blooop saved you from mass-backspacing a typo in Claude Code, mass-backspacing a typo in ChatGPT, or mass-backspacing a typo in a commit message you were dictating to fix a typo... you know what to do.
+
+PRs welcome. Issues welcome. Feature requests welcome. Honestly just any engagement with another human being is welcome at this point.
 
 ## License
 

@@ -1,7 +1,9 @@
 mlx-whisper
 sounddevice
 soundfile
-numpy
+numpy<2
 pyperclip
 pynput
 pywebview
+pyobjc-framework-AVFoundation
+pillow
