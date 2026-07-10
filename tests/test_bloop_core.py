@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import types
 import unittest
 
@@ -624,9 +625,152 @@ class BloopCoreTests(unittest.TestCase):
         # The mic stream must not outlive the recording session. A stream left
         # open for hours goes stale across sleep/wake and device swaps, and
         # closing/reopening it later was the long-uptime native-crash path —
-        # it also kept the macOS orange mic indicator lit while idle.
-        src = inspect.getsource(self.bloop.BloopFlow.stop_recording)
+        # it also kept the macOS orange mic indicator lit while idle. The
+        # actual close now happens after the stop-grace tail, in
+        # _finalize_stop_locked, but stop_recording is still what schedules
+        # it (via a timer running _finalize_stop) so the stream is guaranteed
+        # to be released shortly after every stop.
+        src = inspect.getsource(self.bloop.BloopFlow._finalize_stop_locked)
         self.assertIn("self._close_stream()", src)
+        src = inspect.getsource(self.bloop.BloopFlow.stop_recording)
+        self.assertIn("threading.Timer(STOP_GRACE_TAIL_SEC, self._finalize_stop)", src)
+        self.assertIn("timer.start()", src)
+
+    def test_stop_grace_tail_constant_is_a_short_reasonable_delay(self):
+        # STOP_GRACE_TAIL_SEC is the whole fix for end-of-speech truncation:
+        # long enough for CoreAudio's already-buffered tail (or a trailing
+        # word) to land, short enough that "stop" still feels instant.
+        self.assertGreater(self.bloop.STOP_GRACE_TAIL_SEC, 0.2)
+        self.assertLess(self.bloop.STOP_GRACE_TAIL_SEC, 0.5)
+
+    def test_stop_recording_defers_snapshot_and_flag_flip_to_finalize(self):
+        # stop_recording must NOT flip `recording` False or snapshot
+        # `frames` itself anymore -- that used to happen immediately and cut
+        # off whatever the user was still saying (or whatever CoreAudio had
+        # not yet delivered). It only marks intent (_stop_pending) and
+        # schedules the real work, on a grace timer, in _finalize_stop.
+        src = inspect.getsource(self.bloop.BloopFlow.stop_recording)
+        self.assertIn("self._stop_pending = True", src)
+        self.assertNotIn("self.recording = False", src)
+        self.assertNotIn("self.frames[:]", src)
+        self.assertNotIn("self.frames    = []", src)
+        self.assertIn("threading.Timer(STOP_GRACE_TAIL_SEC, self._finalize_stop)", src)
+
+    def test_stop_recording_returns_early_on_double_stop(self):
+        # A second stop hitting while the grace timer is already pending
+        # (e.g. a repeated hotkey release) must be a no-op rather than
+        # scheduling a second finalize or resetting the grace window.
+        src = inspect.getsource(self.bloop.BloopFlow.stop_recording)
+        self.assertIn("if not self.recording or self._stop_pending:", src)
+        self.assertIn("return", src)
+
+    def test_restart_during_grace_flushes_previous_take_first(self):
+        # A fast stop -> talk-again must not be swallowed by the still-true
+        # `recording` flag during the grace tail: start_recording flushes
+        # (finalizes) the previous take unconditionally before deciding
+        # whether it's already recording.
+        src = inspect.getsource(self.bloop.BloopFlow.start_recording)
+        finalize_idx = src.index("self._finalize_stop()")
+        recording_check_idx = src.index("if self.recording:")
+        self.assertLess(finalize_idx, recording_check_idx)
+
+        # The deferred-start and double-tap-latch paths read `recording=True`
+        # during a pending grace stop as "not really recording", or a quick
+        # stop->talk-again during the grace window would be dropped.
+        src = inspect.getsource(self.bloop.BloopFlow._delayed_start_if_held)
+        self.assertIn("self._stop_pending or not self.recording", src)
+        src = inspect.getsource(self.bloop.BloopFlow._handle_ptt_press)
+        self.assertIn("if self._stop_pending or not self.recording:", src)
+
+    def test_finalize_stop_serializes_and_delegates_to_locked_impl(self):
+        # The grace timer firing and a restart cutting the grace short race
+        # on the same finalize path; _finalize_stop must serialize through
+        # _stop_finalize_lock before running the actual (idempotent) work in
+        # _finalize_stop_locked.
+        src = inspect.getsource(self.bloop.BloopFlow._finalize_stop)
+        self.assertIn("with self._stop_finalize_lock:", src)
+        self.assertIn("self._finalize_stop_locked()", src)
+
+        src = inspect.getsource(self.bloop.BloopFlow._finalize_stop_locked)
+        self.assertIn("if not self._stop_pending:", src)
+        self.assertIn("self.recording = False", src)
+        self.assertIn("frames = self.frames[:]", src)
+        self.assertIn("self._close_stream()", src)
+        self.assertIn("self._queue_transcribe(", src)
+
+    def test_finalize_stop_flushes_frames_added_during_grace_tail(self):
+        # Behavioral: this is the actual bug being fixed. A frame delivered
+        # by _audio_callback after stop_recording() returns (but before the
+        # grace timer fires) must still reach the transcriber -- it must not
+        # be dropped just because stop_recording already ran.
+        bloop = self.bloop
+        flow = object.__new__(bloop.BloopFlow)
+        flow._lock = threading.Lock()
+        flow.recording = True
+        flow.frames = ["frame-before-stop"]
+        flow._stop_pending = False
+        flow._stop_grace_timer = None
+        flow._stop_finalize_lock = threading.Lock()
+        flow._chunk_stop = threading.Event()
+        flow._start_timer = None
+        flow._viz = None
+        flow._active_paste_target = "com.example.test"
+        flow._stream_rate = bloop.SAMPLE_RATE
+        flow._session_lock = threading.Lock()
+        flow._latch_session_id = None
+
+        queued = []
+        flow._queue_transcribe = lambda **kwargs: queued.append(kwargs)
+        flow._close_stream = lambda: None
+
+        captured = {}
+
+        class _FakeTimer:
+            def __init__(self, interval, function, *a, **kw):
+                captured["interval"] = interval
+                captured["function"] = function
+                self.daemon = False
+
+            def start(self):
+                captured["started"] = True
+
+            def cancel(self):
+                captured["cancelled"] = True
+
+        real_threading = bloop.threading
+        fake_threading = types.SimpleNamespace(
+            **{
+                name: getattr(real_threading, name)
+                for name in dir(real_threading)
+                if not name.startswith("__")
+            }
+        )
+        fake_threading.Timer = _FakeTimer
+        bloop.threading = fake_threading
+        try:
+            flow.stop_recording()
+            # stop_recording must not have snapshotted/cleared frames itself.
+            self.assertTrue(flow.recording)
+            self.assertTrue(flow._stop_pending)
+            self.assertEqual(flow.frames, ["frame-before-stop"])
+            self.assertEqual(captured["interval"], bloop.STOP_GRACE_TAIL_SEC)
+
+            # A frame lands (as _audio_callback would append it) during the
+            # grace window, before the timer fires.
+            flow.frames.append("frame-during-grace")
+
+            # Fire the captured timer callback -- this is _finalize_stop.
+            captured["function"]()
+        finally:
+            bloop.threading = real_threading
+
+        self.assertFalse(flow.recording)
+        self.assertFalse(flow._stop_pending)
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(
+            queued[0]["frames"], ["frame-before-stop", "frame-during-grace"]
+        )
+        self.assertEqual(queued[0]["paste_target"], "com.example.test")
 
     def test_start_recording_surfaces_stream_open_failure(self):
         src = inspect.getsource(self.bloop.BloopFlow.start_recording)
@@ -701,6 +845,135 @@ class BloopCoreTests(unittest.TestCase):
         src = inspect.getsource(self.bloop.WaveformVisualizer.__init__)
         self.assertIn("_create_pill_panel", src)
 
+    def test_pill_panel_follows_active_screen(self):
+        # On multi-display setups the pill was hard-pinned to screens[0], so
+        # it only ever appeared on the primary monitor. It must target the
+        # screen hosting the focused (frontmost) window, with the pointer's
+        # screen as fallback, and re-pick the screen every time it is shown.
+        src = inspect.getsource(self.bloop._position_pill_panel)
+        self.assertIn("_pill_target_screen(force=force)", src)
+        src = inspect.getsource(self.bloop._pill_target_screen)
+        self.assertIn("_cg_frontmost_window_bounds()", src)
+        self.assertIn("NSEvent.mouseLocation()", src)
+        src = inspect.getsource(self.bloop.WaveformVisualizer._set_overlay_visible)
+        self.assertIn(
+            "_position_pill_panel(self._native_panel, self.W, self.H, force=True)", src
+        )
+
+    def test_screen_containing_appkit_point(self):
+        def _screen(x, y, w, h):
+            frame = types.SimpleNamespace(
+                origin=types.SimpleNamespace(x=x, y=y),
+                size=types.SimpleNamespace(width=w, height=h),
+            )
+            return types.SimpleNamespace(frame=lambda f=frame: f)
+
+        # Laptop primary + external above-right, AppKit (bottom-left) coords.
+        primary = _screen(0, 0, 1512, 982)
+        external = _screen(1512, 120, 2560, 1440)
+        screens = [primary, external]
+        contains = self.bloop._screen_containing_appkit_point
+        self.assertIs(contains(100, 100, screens), primary)
+        self.assertIs(contains(2000, 800, screens), external)
+        self.assertIsNone(contains(-50, 50, screens))
+
+    def test_pill_tick_recycles_panel_when_server_drops_it(self):
+        # "Sometimes the pill doesn't overlay" — orderFrontRegardless alone
+        # can't detect that the window server silently dropped the panel from
+        # the active Space. The tick must ask the server (kCGWindowIsOnscreen),
+        # recycle the window order when dropped, and breadcrumb the episode.
+        src = inspect.getsource(self.bloop.WaveformVisualizer._tick)
+        self.assertIn("_pill_panel_is_composited(self._native_panel) is False", src)
+        self.assertIn("self._native_panel.orderOut_(None)", src)
+        self.assertIn('"pill_not_composited"', src)
+        src = inspect.getsource(self.bloop._pill_panel_is_composited)
+        self.assertIn("kCGWindowIsOnscreen", src)
+
+    def test_pill_tick_escalates_to_rebuild_when_recycle_fails(self):
+        # Observed 2026-07-07..09: once the server drops the panel, the
+        # orderOut/orderFront recycle never restores it — every session logs
+        # pill_not_composited and the pill stays invisible. The tick must
+        # escalate to a full panel rebuild (fresh window number), bounded per
+        # visibility episode, and reset the counters when the pill is shown.
+        src = inspect.getsource(self.bloop.WaveformVisualizer._tick)
+        self.assertIn("self._pill_drop_streak", src)
+        self.assertIn("self._rebuild_native_panel()", src)
+        self.assertIn("PILL_MAX_REBUILDS_PER_EPISODE", src)
+        src = inspect.getsource(self.bloop.WaveformVisualizer._rebuild_native_panel)
+        self.assertIn("_create_pill_panel", src)
+        self.assertIn('"pill_panel_rebuilt"', src)
+        # Create-then-swap: a failed create must leave the old panel alive.
+        self.assertLess(src.index("_create_pill_panel"), src.index("old = self._native_panel"))
+        src = inspect.getsource(self.bloop.WaveformVisualizer._set_overlay_visible)
+        self.assertIn("self._pill_drop_streak = 0", src)
+        self.assertIn("self._pill_rebuilds = 0", src)
+
+    def test_prompt_echo_filtered(self):
+        prompt = self.bloop._custom_vocab_initial_prompt(["Blooop"])
+        # The observed confabulation: silent chunk -> near-verbatim echo of
+        # the prompt's instruction tail ("the" for "these").
+        self.assertTrue(self.bloop._looks_like_prompt_echo(
+            "Use the exact spellings when they match the spoken audio.", prompt))
+        self.assertTrue(self.bloop._looks_like_prompt_echo(
+            "Use these exact spellings when they match the spoken audio.", prompt))
+        self.assertTrue(self.bloop._looks_like_prompt_echo(
+            "Preferred spellings, product names, and proper nouns.", prompt))
+        # Real dictation, vocab words, and degenerate inputs pass through.
+        self.assertFalse(self.bloop._looks_like_prompt_echo(
+            "Let's grab lunch after the meeting tomorrow.", prompt))
+        self.assertFalse(self.bloop._looks_like_prompt_echo("Blooop", prompt))
+        self.assertFalse(self.bloop._looks_like_prompt_echo("", prompt))
+        self.assertFalse(self.bloop._looks_like_prompt_echo(None, prompt))
+        self.assertFalse(self.bloop._looks_like_prompt_echo("anything at all here", None))
+
+    def test_segment_confidence_filter(self):
+        prompt = self.bloop._custom_vocab_initial_prompt(["Blooop"])
+        real = " So let's wire up the new settings panel."
+        result = {
+            "text": "So let's wire up the new settings panel. Use the exact "
+                    "spellings when they match the spoken audio. random noise words",
+            "segments": [
+                {"text": real, "no_speech_prob": 0.02, "avg_logprob": -0.25},
+                # Confident prompt echo: survives whisper's built-in gate
+                # (logprob above -0.8) but must be dropped here.
+                {"text": " Use the exact spellings when they match the spoken audio.",
+                 "no_speech_prob": 0.90, "avg_logprob": -0.30},
+                # Sounded like silence AND decoded poorly.
+                {"text": " random noise words",
+                 "no_speech_prob": 0.85, "avg_logprob": -0.90},
+            ],
+        }
+        text, dropped = self.bloop._filter_result_segments(result, prompt)
+        self.assertEqual(text, real.strip())
+        self.assertEqual(len(dropped), 2)
+
+    def test_segment_filter_untouched_when_clean(self):
+        # No drops -> the exact whole-result text comes back (no re-join
+        # artifacts), and malformed segment payloads fail open.
+        result = {
+            "text": "Hello there.  General Kenobi.",
+            "segments": [
+                {"text": " Hello there. ", "no_speech_prob": 0.01, "avg_logprob": -0.2},
+                {"text": " General Kenobi.", "no_speech_prob": 0.02, "avg_logprob": -0.3},
+            ],
+        }
+        text, dropped = self.bloop._filter_result_segments(result, None)
+        self.assertEqual(text, "Hello there.  General Kenobi.")
+        self.assertEqual(dropped, [])
+        text, dropped = self.bloop._filter_result_segments(
+            {"text": "fallback", "segments": ["not-a-dict"]}, None)
+        self.assertEqual(text, "fallback")
+        self.assertEqual(dropped, [])
+        text, dropped = self.bloop._filter_result_segments({"text": "fallback"}, None)
+        self.assertEqual(text, "fallback")
+        self.assertEqual(dropped, [])
+
+    def test_transcribe_audio_applies_segment_and_echo_filters(self):
+        src = inspect.getsource(self.bloop.BloopFlow._transcribe_audio)
+        self.assertIn("_filter_result_segments(result, initial_prompt)", src)
+        self.assertIn("_looks_like_prompt_echo(text, initial_prompt)", src)
+        self.assertIn('"segments_filtered"', src)
+
     def test_pill_style_setting_round_trip(self):
         out = self.bloop._settings_normalize({"pill_style": "spectrogram"})
         self.assertEqual(out["pill_style"], "spectrogram")
@@ -717,6 +990,75 @@ class BloopCoreTests(unittest.TestCase):
         cached = self.bloop._BloopMenuBarController._cachedRecordingImage
         src = inspect.getsource(getattr(cached, "callable", cached))
         self.assertIn("_bloop_image_cache", src)
+
+    def test_silence_trim_pad_tail_constant_exists_and_is_asymmetric(self):
+        # The tail truncation bug also came from a symmetric silence-trim
+        # pad: the trailing edge got the same (short) pad as the leading
+        # edge, so a soft/trailing word right at the detected voice boundary
+        # got clipped. The tail pad must exist and be at least as generous
+        # as the head pad.
+        self.assertTrue(hasattr(self.bloop, "SILENCE_TRIM_PAD_TAIL_MS"))
+        self.assertGreaterEqual(
+            self.bloop.SILENCE_TRIM_PAD_TAIL_MS, self.bloop.SILENCE_TRIM_PAD_MS
+        )
+
+    def test_silence_presets_all_define_pad_tail_ms(self):
+        for name, cfg in self.bloop.SILENCE_PRESETS.items():
+            self.assertIn("pad_tail_ms", cfg, f"preset {name!r} missing pad_tail_ms")
+            self.assertGreaterEqual(
+                cfg["pad_tail_ms"], cfg["pad_ms"],
+                f"preset {name!r} tail pad shorter than head pad",
+            )
+
+    def test_apply_silence_preset_sets_tail_pad_global(self):
+        src = inspect.getsource(self.bloop._apply_silence_preset)
+        self.assertIn("global SILENCE_TRIM_PAD_TAIL_MS", src)
+        # Strict lookup, matching every other preset field: a preset missing
+        # pad_tail_ms should fail loudly, not silently inherit the previous
+        # preset's tail pad.
+        self.assertIn('int(cfg["pad_tail_ms"])', src)
+
+        self.bloop._apply_silence_preset("aggressive")
+        try:
+            self.assertEqual(
+                self.bloop.SILENCE_TRIM_PAD_TAIL_MS,
+                self.bloop.SILENCE_PRESETS["aggressive"]["pad_tail_ms"],
+            )
+        finally:
+            self.bloop._apply_silence_preset(self.bloop.DEFAULT_SILENCE_PRESET)
+
+    def test_trim_silence_uses_asymmetric_pad_for_end_index(self):
+        src = inspect.getsource(self.bloop.BloopFlow._trim_silence)
+        self.assertIn(
+            "pad_tail = int(src_rate * (SILENCE_TRIM_PAD_TAIL_MS / 1000.0))", src
+        )
+        self.assertIn("end = min(len(audio), last * hop + frame + pad_tail)", src)
+        # The head pad must still use the (shorter) head constant, not the
+        # tail constant, or the asymmetry silently collapses.
+        self.assertIn("pad = int(src_rate * (SILENCE_TRIM_PAD_MS / 1000.0))", src)
+        self.assertIn("start = max(0, first * hop - pad)", src)
+
+    def test_whisper_tail_pad_constant_is_positive(self):
+        # Even after silence trimming, Whisper's own attention window can
+        # clip the very last phoneme of an utterance ending right at frame
+        # zero of a hard cut. WHISPER_TAIL_PAD_SEC appends silence so the
+        # model never sees audio ending abruptly at the last word.
+        self.assertGreater(self.bloop.WHISPER_TAIL_PAD_SEC, 0)
+
+    def test_transcribe_audio_pads_tail_after_resample(self):
+        src = inspect.getsource(self.bloop.BloopFlow._transcribe_audio)
+        resample_idx = src.index("self._resample_audio(")
+        pad_idx = src.index("WHISPER_TAIL_PAD_SEC > 0")
+        self.assertLess(resample_idx, pad_idx)
+        self.assertIn(
+            "np.zeros(int(SAMPLE_RATE * WHISPER_TAIL_PAD_SEC), dtype=\"float32\")",
+            src,
+        )
+        # The padded array must be what actually gets written to the wav
+        # fed to Whisper, not a discarded local.
+        concat_idx = src.index("model_audio = np.concatenate(")
+        write_idx = src.index("sf.write(tmp, model_audio, SAMPLE_RATE)")
+        self.assertLess(concat_idx, write_idx)
 
 
 if __name__ == "__main__":

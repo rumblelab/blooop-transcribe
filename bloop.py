@@ -25,6 +25,7 @@ import sys
 # Without this, multiprocessing child processes re-invoke the executable
 # with internal arguments that the CLI parser can't handle.
 multiprocessing.freeze_support()
+import difflib
 import errno
 import signal
 import sqlite3
@@ -570,7 +571,7 @@ def _macos_set_dock_badge(label):
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-RUNTIME_BUILD = "2026-07-02-latch-and-model-ux"
+RUNTIME_BUILD = "2026-07-09-pill-rebuild-and-echo-filter"
 
 # MLX Whisper model from HuggingFace (downloaded on first use, cached after).
 # Faster / smaller  →  mlx-community/whisper-tiny-mlx   (~39 MB)
@@ -602,6 +603,13 @@ AUTO_PASTE = True
 # Minimum audio duration (seconds) to bother transcribing.
 MIN_DURATION = 0.4
 
+# Keep capturing this long after the stop hotkey lands before snapshotting the
+# buffer. Covers both the CoreAudio input latency (the last ~50-150ms of real
+# speech is still in flight when the flag flips) and the human habit of hitting
+# the key while the final syllable is still coming out. The UI flips to
+# "transcribing" immediately; only the buffer grab is deferred.
+STOP_GRACE_TAIL_SEC = 0.30
+
 # Decoding guardrails to reduce silence/noise hallucinations. The temperature
 # LADDER matters: compression_ratio/logprob thresholds only mark a segment as
 # "needs re-decode", and the re-decode happens at the next temperature in the
@@ -612,16 +620,34 @@ WHISPER_COMPRESSION_RATIO_THRESHOLD = 2.2
 WHISPER_LOGPROB_THRESHOLD = -0.8
 WHISPER_NO_SPEECH_THRESHOLD = 0.45
 WHISPER_CONDITION_ON_PREVIOUS_TEXT = False
+# Post-decode per-segment gate. Whisper's built-in no_speech gate keeps a
+# "silent" segment whenever its text decodes confidently (avg_logprob above
+# logprob_threshold) — which is exactly how fluent confabulations like
+# initial-prompt echoes survive it. Re-screen each returned segment with a
+# stricter combination: sounded like silence AND decoded worse than clean
+# speech does. Clean dictation on the medium model sits well inside both
+# bounds (no_speech_prob < ~0.3, avg_logprob > ~-0.4).
+WHISPER_SEGMENT_NO_SPEECH_PROB = 0.6
+WHISPER_SEGMENT_AVG_LOGPROB = -0.45
 
 # Trim leading/trailing silence before transcription to reduce hallucinations
-# from long pauses. Keeps chunking behavior intact by adding padding.
+# from long pauses. Keeps chunking behavior intact by adding padding. The pad
+# is asymmetric: trailing consonants (s/f/t, soft word endings) are low-energy
+# and routinely fall below the voiced threshold, so the tail keeps more than
+# the head — a tight head pad still guards against silence hallucinations.
 SILENCE_TRIM_ENABLED = True
 SILENCE_TRIM_DBFS = -42.0
 SILENCE_TRIM_WINDOW_MS = 24
 SILENCE_TRIM_HOP_MS = 12
 SILENCE_TRIM_PAD_MS = 180
+SILENCE_TRIM_PAD_TAIL_MS = 400
 SILENCE_MIN_VOICED_SEC = 0.22
 SILENCE_DYNAMIC_MULT = 2.8
+
+# Whisper reliably drops or mangles the final word when the audio ends right
+# at the word boundary — which is exactly what a hotkey stop + trailing trim
+# produce. Append this much literal silence so decoding never ends mid-decay.
+WHISPER_TAIL_PAD_SEC = 0.4
 
 
 SAMPLE_RATE = 16_000   # Whisper expects 16 kHz
@@ -732,6 +758,7 @@ SILENCE_PRESETS = {
         "window_ms": 24,
         "hop_ms": 12,
         "pad_ms": 180,
+        "pad_tail_ms": 400,
         "min_voiced_sec": 0.22,
         "dynamic_mult": 2.8,
     },
@@ -741,6 +768,7 @@ SILENCE_PRESETS = {
         "window_ms": 24,
         "hop_ms": 12,
         "pad_ms": 180,
+        "pad_tail_ms": 400,
         "min_voiced_sec": 0.22,
         "dynamic_mult": 2.8,
     },
@@ -750,6 +778,7 @@ SILENCE_PRESETS = {
         "window_ms": 20,
         "hop_ms": 10,
         "pad_ms": 140,
+        "pad_tail_ms": 320,
         "min_voiced_sec": 0.28,
         "dynamic_mult": 3.2,
     },
@@ -868,16 +897,18 @@ def _normalize_custom_vocab(raw):
     return out or list(DEFAULT_CUSTOM_VOCAB)
 
 
+# Split out so the prompt-echo filter can match either half on its own —
+# Whisper usually parrots just the instruction tail, not the vocab list.
+_VOCAB_PROMPT_HEAD = "Preferred spellings, product names, and proper nouns: "
+_VOCAB_PROMPT_TAIL = "Use these exact spellings when they match the spoken audio."
+
+
 def _custom_vocab_initial_prompt(items):
     vocab = _normalize_custom_vocab(items)
     if not vocab:
         return None
 
-    prompt = (
-        "Preferred spellings, product names, and proper nouns: "
-        + ", ".join(vocab)
-        + ". Use these exact spellings when they match the spoken audio."
-    )
+    prompt = _VOCAB_PROMPT_HEAD + ", ".join(vocab) + ". " + _VOCAB_PROMPT_TAIL
     if len(prompt) > 720:
         prompt = prompt[:717].rstrip(", ") + "..."
     return prompt
@@ -1010,6 +1041,81 @@ def _looks_like_hallucination(text):
     return False
 
 
+def _echo_normalize(s):
+    return re.sub(r"[\W_]+", " ", s.lower()).strip()
+
+
+def _looks_like_prompt_echo(text, prompt):
+    """True when the output is Whisper parroting the initial prompt back —
+    the dominant silence confabulation once an initial_prompt is supplied
+    (observed 2026-07-09: silent latch chunk -> "Use the exact spellings when
+    they match the spoken audio."). Echoes are near-verbatim but not exact
+    ("the" for "these"), so compare normalized token streams by similarity
+    ratio, against the full prompt and against each fixed half on its own.
+    """
+    if not text or not prompt:
+        return False
+    t = _echo_normalize(text)
+    if len(t.split()) < 3:
+        # Too short to attribute to the prompt; vocab words alone ("Blooop")
+        # are legitimate dictation and the blacklist covers the classics.
+        return False
+    references = (
+        _echo_normalize(prompt),
+        _echo_normalize(_VOCAB_PROMPT_HEAD),
+        _echo_normalize(_VOCAB_PROMPT_TAIL),
+    )
+    for reference in references:
+        if not reference or len(reference.split()) < 3:
+            continue
+        if t in reference:
+            return True
+        if difflib.SequenceMatcher(None, t, reference).ratio() >= 0.75:
+            return True
+    return False
+
+
+def _filter_result_segments(result, prompt=None):
+    """Re-screen Whisper's per-segment output for silence confabulations the
+    built-in gates keep (see WHISPER_SEGMENT_* above): segments that sounded
+    like silence and decoded poorly, plus initial-prompt echoes. Returns
+    (text, dropped) where dropped is a list of short descriptions of the
+    discarded segments; when nothing is dropped, text is the untouched
+    whole-result text."""
+    whole_text = (result.get("text") or "").strip()
+    segments = result.get("segments") or []
+    if not isinstance(segments, (list, tuple)):
+        return whole_text, []
+    kept, dropped = [], []
+    for seg in segments:
+        if not isinstance(seg, dict):
+            return whole_text, []
+        seg_text = (seg.get("text") or "").strip()
+        if not seg_text:
+            continue
+        try:
+            no_speech = float(seg.get("no_speech_prob", 0.0))
+            avg_logprob = float(seg.get("avg_logprob", 0.0))
+        except (TypeError, ValueError):
+            kept.append(seg_text)
+            continue
+        if (
+            no_speech > WHISPER_SEGMENT_NO_SPEECH_PROB
+            and avg_logprob < WHISPER_SEGMENT_AVG_LOGPROB
+        ):
+            dropped.append(
+                f"no_speech={no_speech:.2f} logprob={avg_logprob:.2f} {seg_text[:60]!r}"
+            )
+            continue
+        if _looks_like_prompt_echo(seg_text, prompt):
+            dropped.append(f"prompt_echo {seg_text[:60]!r}")
+            continue
+        kept.append(seg_text)
+    if not dropped:
+        return whole_text, []
+    return " ".join(kept).strip(), dropped
+
+
 def _settings_pick_write_path(candidates):
     global _SETTINGS_ACTIVE_PATH
     if _SETTINGS_ACTIVE_PATH:
@@ -1119,6 +1225,7 @@ def _apply_silence_preset(name):
     global SILENCE_TRIM_WINDOW_MS
     global SILENCE_TRIM_HOP_MS
     global SILENCE_TRIM_PAD_MS
+    global SILENCE_TRIM_PAD_TAIL_MS
     global SILENCE_MIN_VOICED_SEC
     global SILENCE_DYNAMIC_MULT
 
@@ -1128,6 +1235,7 @@ def _apply_silence_preset(name):
     SILENCE_TRIM_WINDOW_MS = int(cfg["window_ms"])
     SILENCE_TRIM_HOP_MS = int(cfg["hop_ms"])
     SILENCE_TRIM_PAD_MS = int(cfg["pad_ms"])
+    SILENCE_TRIM_PAD_TAIL_MS = int(cfg["pad_tail_ms"])
     SILENCE_MIN_VOICED_SEC = float(cfg["min_voiced_sec"])
     SILENCE_DYNAMIC_MULT = float(cfg["dynamic_mult"])
 
@@ -1848,13 +1956,130 @@ def _create_pill_panel(width, height):
     return panel, view
 
 
-def _position_pill_panel(panel, width, height):
-    """Pin to the top-right of the primary screen, under the menu bar."""
+def _cg_frontmost_window_bounds():
+    """Bounds (CG coords: top-left origin, y down) of the frontmost regular
+    window of any *other* app on the active Space, or None. CGWindowList
+    returns front-to-back, so the first layer-0 hit is the focused window."""
     try:
-        from AppKit import NSScreen
+        import Quartz
 
-        screens = NSScreen.screens()
-        screen = screens[0] if screens else NSScreen.mainScreen()
+        info = Quartz.CGWindowListCopyWindowInfo(
+            Quartz.kCGWindowListOptionOnScreenOnly
+            | Quartz.kCGWindowListExcludeDesktopElements,
+            Quartz.kCGNullWindowID,
+        )
+        me = os.getpid()
+        for win in info or []:
+            try:
+                if int(win.get("kCGWindowLayer", -1)) != 0:
+                    continue
+                if int(win.get("kCGWindowOwnerPID", -1)) == me:
+                    continue
+                if float(win.get("kCGWindowAlpha", 1.0)) <= 0.05:
+                    continue
+                b = win.get("kCGWindowBounds") or {}
+                w, h = float(b.get("Width", 0.0)), float(b.get("Height", 0.0))
+                if w < 64.0 or h < 64.0:
+                    continue  # status-item slivers, palettes
+                return (float(b.get("X", 0.0)), float(b.get("Y", 0.0)), w, h)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+def _screen_containing_appkit_point(x, y, screens):
+    for screen in screens:
+        try:
+            f = screen.frame()
+            if (
+                f.origin.x <= x < f.origin.x + f.size.width
+                and f.origin.y <= y < f.origin.y + f.size.height
+            ):
+                return screen
+        except Exception:
+            continue
+    return None
+
+
+# The active-screen lookup walks the window list, so cache it between
+# reposition ticks; force=True (used when the pill is shown) bypasses it.
+_PILL_SCREEN_CACHE = {"t": 0.0, "screen": None}
+_PILL_SCREEN_REFRESH_SEC = 0.5
+
+
+def _pill_target_screen(force=False):
+    """The screen the user is working on: prefer the screen hosting the
+    focused (frontmost) window, then the one with the pointer, then primary.
+    This keeps the pill on whichever display the user is actually looking at
+    instead of hard-pinning it to the primary screen."""
+    from AppKit import NSEvent, NSScreen
+
+    screens = list(NSScreen.screens() or [])
+    if not screens:
+        return NSScreen.mainScreen()
+    if len(screens) == 1:
+        return screens[0]
+
+    now = time.monotonic()
+    cached = _PILL_SCREEN_CACHE["screen"]
+    if (
+        not force
+        and cached is not None
+        and (now - _PILL_SCREEN_CACHE["t"]) < _PILL_SCREEN_REFRESH_SEC
+        and any(cached is s for s in screens)
+    ):
+        return cached
+
+    chosen = None
+    # CG coords have a top-left origin; AppKit a bottom-left one. Both are
+    # anchored to the primary screen (screens[0], whose frame origin is 0,0).
+    primary_h = screens[0].frame().size.height
+    bounds = _cg_frontmost_window_bounds()
+    if bounds is not None:
+        cx = bounds[0] + bounds[2] / 2.0
+        cy = primary_h - (bounds[1] + bounds[3] / 2.0)
+        chosen = _screen_containing_appkit_point(cx, cy, screens)
+    if chosen is None:
+        try:
+            loc = NSEvent.mouseLocation()
+            chosen = _screen_containing_appkit_point(loc.x, loc.y, screens)
+        except Exception:
+            chosen = None
+    if chosen is None:
+        chosen = screens[0]
+
+    _PILL_SCREEN_CACHE["t"] = now
+    _PILL_SCREEN_CACHE["screen"] = chosen
+    return chosen
+
+
+def _pill_panel_is_composited(panel):
+    """Ask the window server whether the panel is actually on the active
+    Space. True/False when known, None when the check itself failed (never
+    act on None). This is the ground truth `orderFrontRegardless` can't see:
+    the panel can believe it is visible while the server has dropped it."""
+    try:
+        import Quartz
+
+        num = int(panel.windowNumber())
+        if num <= 0:
+            return None
+        info = Quartz.CGWindowListCopyWindowInfo(
+            Quartz.kCGWindowListOptionIncludingWindow, num
+        )
+        if not info:
+            return False
+        return bool(info[0].get("kCGWindowIsOnscreen", False))
+    except Exception:
+        return None
+
+
+def _position_pill_panel(panel, width, height, force=False):
+    """Pin to the top-right of the active screen, under the menu bar."""
+    try:
+        screen = _pill_target_screen(force=force)
         if screen is None:
             return
         vf = screen.visibleFrame()  # excludes menu bar (and Dock)
@@ -2056,6 +2281,14 @@ class WaveformVisualizer:
     HIDDEN_ALPHA  = 0.0
     REPOSITION_INTERVAL_SEC = 0.16
     FRONT_ASSERT_INTERVAL_SEC = 0.5
+    # Not-composited escalation: after this many consecutive failed checks
+    # the orderOut/orderFront recycle has demonstrably not re-composited the
+    # panel (observed 2026-07-07..09: recycle never recovered once the server
+    # dropped the window), so rebuild it under a fresh window number. Capped
+    # per visibility episode so a hostile window-server state can't make us
+    # churn panels twice a second forever.
+    PILL_REBUILD_AFTER_DROPS = 2
+    PILL_MAX_REBUILDS_PER_EPISODE = 3
 
     def __init__(self, enabled=True, show_window=True, pill_style="bubbles"):
         self._enabled = bool(enabled)
@@ -2144,6 +2377,11 @@ class WaveformVisualizer:
         self._alpha_supported = False
         self._last_overlay_reposition = 0.0
         self._last_front_assert = 0.0
+        # One breadcrumb per visibility episode when the window server drops
+        # the pill from the active Space (see _pill_panel_is_composited).
+        self._pill_drop_logged = False
+        self._pill_drop_streak = 0
+        self._pill_rebuilds = 0
         # Native pill simulations (advanced in _draw_native).
         self._bubble_pool = [
             dict(alive=False, x=0.0, y=0.0, r=1.0, vy=0.0, wob=random.random() * 6.0)
@@ -2244,13 +2482,50 @@ class WaveformVisualizer:
             except Exception:
                 pass
 
+    def _rebuild_native_panel(self):
+        """Replace the pill NSPanel with a freshly created one. A new panel
+        gets a new window number, which re-registers it with the window
+        server — the recovery of last resort once the server has dropped the
+        old window's record from the active Space and order recycling no
+        longer takes. Create-then-swap so a failed create leaves the old
+        panel (and the recycle fallback) in place."""
+        try:
+            pw, ph = PILL_STYLE_DIMS[self._pill_style]
+            panel, view = _create_pill_panel(pw, ph)
+        except Exception as exc:
+            _issues_append("pill_rebuild_failed", "pill panel recreate failed", exc=exc)
+            return False
+        old = self._native_panel
+        self._native_panel = panel
+        self._native_view = view
+        try:
+            _position_pill_panel(panel, self.W, self.H, force=True)
+            panel.orderFrontRegardless()
+        except Exception:
+            pass
+        if old is not None:
+            try:
+                old.orderOut_(None)
+                old.close()
+            except Exception:
+                pass
+        _issues_append(
+            "pill_panel_rebuilt",
+            f"pill panel recreated after failed recycle "
+            f"(rebuild {self._pill_rebuilds}/{self.PILL_MAX_REBUILDS_PER_EPISODE} this episode)",
+        )
+        return True
+
     def _set_overlay_visible(self, visible):
         if not self._show_window:
             return
         if self._native_panel is not None:
             try:
                 if visible:
-                    _position_pill_panel(self._native_panel, self.W, self.H)
+                    self._pill_drop_logged = False
+                    self._pill_drop_streak = 0
+                    self._pill_rebuilds = 0
+                    _position_pill_panel(self._native_panel, self.W, self.H, force=True)
                     self._native_panel.orderFrontRegardless()
                 else:
                     self._native_panel.orderOut_(None)
@@ -2372,7 +2647,36 @@ class WaveformVisualizer:
                 if (now - self._last_front_assert) >= self.FRONT_ASSERT_INTERVAL_SEC:
                     self._last_front_assert = now
                     try:
-                        self._native_panel.orderFrontRegardless()
+                        if _pill_panel_is_composited(self._native_panel) is False:
+                            # The server dropped us from the active Space even
+                            # though the panel thinks it is visible. Cycle
+                            # out+front first; breadcrumb once per visibility
+                            # episode so issues.log records the invisible-
+                            # while-recording windows. If the drop persists
+                            # across checks the recycle isn't taking — the
+                            # panel's window-server record is stuck — so
+                            # escalate to a full rebuild (fresh window
+                            # number), bounded per episode.
+                            self._pill_drop_streak += 1
+                            if not self._pill_drop_logged:
+                                self._pill_drop_logged = True
+                                _issues_append(
+                                    "pill_not_composited",
+                                    "pill panel missing from active Space while visible; recycling window order",
+                                )
+                            if (
+                                self._pill_drop_streak >= self.PILL_REBUILD_AFTER_DROPS
+                                and self._pill_rebuilds < self.PILL_MAX_REBUILDS_PER_EPISODE
+                            ):
+                                self._pill_drop_streak = 0
+                                self._pill_rebuilds += 1
+                                self._rebuild_native_panel()
+                            else:
+                                self._native_panel.orderOut_(None)
+                                self._native_panel.orderFrontRegardless()
+                        else:
+                            self._pill_drop_streak = 0
+                            self._native_panel.orderFrontRegardless()
                     except Exception:
                         pass
                 self._reposition_overlay()
@@ -3981,6 +4285,9 @@ class BloopFlow:
         self._teardown_idle.set()
         self._audio_wedged = False
         self._quitting = False
+        self._stop_pending = False
+        self._stop_grace_timer = None
+        self._stop_finalize_lock = threading.Lock()
         self._key_held  = False
         self._press_time = 0.0
         self._last_release = 0.0
@@ -4720,7 +5027,11 @@ class BloopFlow:
 
     def _delayed_start_if_held(self):
         self._start_timer = None
-        if self._key_held and not self.recording and not self.latched:
+        # A pending grace-tail stop still reads as recording=True; treat it as
+        # stopped so a quick stop→talk-again doesn't swallow the new take
+        # (start_recording flushes the previous one first).
+        if self._key_held and not self.latched and (
+                self._stop_pending or not self.recording):
             self.start_recording()
 
     def _start_chunk_worker_if_needed(self):
@@ -4864,6 +5175,10 @@ class BloopFlow:
         if not self._mlx_runtime_ok:
             self._notify_mlx_unavailable_once()
             return
+        # A restart during the stop grace tail must not be swallowed by the
+        # still-true recording flag: cut the grace short (or wait out an
+        # in-flight finalize), flush the previous take, then start fresh.
+        self._finalize_stop()
         with self._lock:
             if self.recording:
                 return
@@ -4898,6 +5213,40 @@ class BloopFlow:
         self._cancel_start_timer()
         self._stop_chunk_worker()
         with self._lock:
+            if not self.recording or self._stop_pending:
+                return
+            self._stop_pending = True
+        # Don't snapshot the buffer yet: the hotkey lands while the last words
+        # are still in the CoreAudio input buffer (or still being spoken).
+        # Keep the callback appending for a short grace tail and defer only
+        # the buffer grab; the UI flips to "transcribing" right away so the
+        # stop still feels instant.
+        if self._viz:
+            self._viz.show_transcribing()
+        timer = threading.Timer(STOP_GRACE_TAIL_SEC, self._finalize_stop)
+        timer.daemon = True
+        self._stop_grace_timer = timer
+        timer.start()
+
+    def _finalize_stop(self):
+        # Serialized: the grace timer and a restart cutting the grace short
+        # can race, and the loser must not proceed until the winner's
+        # _close_stream is done — otherwise it could tear down a stream a
+        # fresh start_recording just opened.
+        with self._stop_finalize_lock:
+            self._finalize_stop_locked()
+
+    def _finalize_stop_locked(self):
+        timer, self._stop_grace_timer = self._stop_grace_timer, None
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception:
+                pass
+        with self._lock:
+            if not self._stop_pending:
+                return
+            self._stop_pending = False
             if not self.recording:
                 return
             self.recording = False
@@ -5041,8 +5390,9 @@ class BloopFlow:
         first = int(np.argmax(voiced))
         last = int(len(voiced) - 1 - np.argmax(voiced[::-1]))
         pad = int(src_rate * (SILENCE_TRIM_PAD_MS / 1000.0))
+        pad_tail = int(src_rate * (SILENCE_TRIM_PAD_TAIL_MS / 1000.0))
         start = max(0, first * hop - pad)
-        end = min(len(audio), last * hop + frame + pad)
+        end = min(len(audio), last * hop + frame + pad_tail)
         if end <= start:
             return np.array([], dtype="float32"), 0.0
 
@@ -5081,6 +5431,11 @@ class BloopFlow:
                 return "no_speech", "", duration, None
 
         model_audio = self._resample_audio(work_audio, src_rate, SAMPLE_RATE)
+        if WHISPER_TAIL_PAD_SEC > 0 and len(model_audio):
+            model_audio = np.concatenate([
+                model_audio,
+                np.zeros(int(SAMPLE_RATE * WHISPER_TAIL_PAD_SEC), dtype="float32"),
+            ])
 
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as fh:
             tmp = fh.name
@@ -5098,7 +5453,13 @@ class BloopFlow:
                 condition_on_previous_text=WHISPER_CONDITION_ON_PREVIOUS_TEXT,
                 initial_prompt=initial_prompt,
             )
-            text = result["text"].strip()
+            text, dropped_segments = _filter_result_segments(result, initial_prompt)
+            if dropped_segments:
+                _issues_append(
+                    "segments_filtered",
+                    f"dropped {len(dropped_segments)} confabulated segment(s): "
+                    + "; ".join(dropped_segments)[:300],
+                )
         except Exception as exc:
             _issues_append("transcribe_failed", "transcribe call failed", exc=exc)
             return "error", "", duration, str(exc)
@@ -5117,6 +5478,13 @@ class BloopFlow:
                     f"silent_input:rms={raw_rms:.6f}:peak={raw_peak:.6f}",
                 )
             return "no_speech", "", duration, None
+        if _looks_like_prompt_echo(text, initial_prompt):
+            return (
+                "no_speech",
+                "",
+                duration,
+                f"prompt_echo_filtered:{text!r}:rms={raw_rms:.6f}",
+            )
         if _looks_like_hallucination(text):
             return (
                 "no_speech",
@@ -5456,7 +5824,7 @@ class BloopFlow:
             self._ignore_release_once = True
             self._last_was_tap = False
             self._cancel_start_timer()
-            if not self.recording:
+            if self._stop_pending or not self.recording:
                 self.start_recording()
             else:
                 key_hint = self._hotkey_info()["label"].lower()
