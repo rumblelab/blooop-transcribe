@@ -630,6 +630,56 @@ WHISPER_CONDITION_ON_PREVIOUS_TEXT = False
 WHISPER_SEGMENT_NO_SPEECH_PROB = 0.6
 WHISPER_SEGMENT_AVG_LOGPROB = -0.45
 
+# Even with the gates above, quiet trailing speech gets confused with silence:
+# Whisper marks a soft-spoken final sentence no_speech>0.6 and decodes it just
+# under the logprob bar, and the filter eats real dictation (proven 2026-07-10
+# via segments_filtered breadcrumbs: "Like, what would be the best?" etc.).
+# Two defenses:
+#
+# 1. Auto-gain: normalize quiet takes up to a healthy speech level before
+#    trim/decode, like every cloud dictation service does. Speech level is the
+#    95th-percentile short-window RMS so pauses don't drag the estimate down.
+AUTO_GAIN_ENABLED = True
+AUTO_GAIN_TARGET_RMS = 0.06      # ≈ -24 dBFS speech-level target
+AUTO_GAIN_MAX = 12.0             # never boost more than ~+21.6 dB
+AUTO_GAIN_PEAK_CEILING = 0.90    # leave clipping headroom
+AUTO_GAIN_WINDOW_SEC = 0.05
+#
+# 2. Energy rescue: before dropping a "confabulated" segment, measure the
+#    actual audio in its time range. Real quiet speech has energy; silence
+#    confabulations decode over near-zero signal. Only segments that are
+#    near-silent by our own measurement stay droppable.
+SEGMENT_VOICED_MIN_RMS = 0.006
+SEGMENT_VOICED_NOISE_MULT = 2.0
+
+# User-facing mic sensitivity. "high" favors picking up quiet speech (looser
+# silence gates), "low" favors suppressing noise/hallucinations in loud rooms.
+# Offsets compose on top of the silence_trim_preset base values.
+DEFAULT_MIC_SENSITIVITY = "normal"
+MIC_SENSITIVITY_PRESETS = {
+    "high": {
+        "dbfs_offset": -6.0,
+        "dynamic_mult_scale": 0.8,
+        "min_voiced_scale": 0.7,
+        "seg_no_speech": 0.80,
+        "seg_avg_logprob": -0.65,
+    },
+    "normal": {
+        "dbfs_offset": 0.0,
+        "dynamic_mult_scale": 1.0,
+        "min_voiced_scale": 1.0,
+        "seg_no_speech": 0.60,
+        "seg_avg_logprob": -0.45,
+    },
+    "low": {
+        "dbfs_offset": 5.0,
+        "dynamic_mult_scale": 1.2,
+        "min_voiced_scale": 1.25,
+        "seg_no_speech": 0.50,
+        "seg_avg_logprob": -0.35,
+    },
+}
+
 # Trim leading/trailing silence before transcription to reduce hallucinations
 # from long pauses. Keeps chunking behavior intact by adding padding. The pad
 # is asymmetric: trailing consonants (s/f/t, soft word endings) are low-energy
@@ -800,6 +850,7 @@ def _settings_defaults():
         "latch_chunk_mode": True,
         "latch_chunk_seconds": 10.0,
         "silence_trim_preset": DEFAULT_SILENCE_PRESET,
+        "mic_sensitivity": DEFAULT_MIC_SENSITIVITY,
         "hotkey": DEFAULT_HOTKEY,
         # Floating recording pill on the top-right of every Space. Most
         # reliable recording indicator since the menu-bar icon can be hidden
@@ -849,6 +900,10 @@ def _settings_normalize(raw):
     silence = raw.get("silence_trim_preset")
     if isinstance(silence, str) and silence in SILENCE_PRESETS:
         out["silence_trim_preset"] = silence
+
+    sensitivity = raw.get("mic_sensitivity")
+    if isinstance(sensitivity, str) and sensitivity in MIC_SENSITIVITY_PRESETS:
+        out["mic_sensitivity"] = sensitivity
 
     hotkey = raw.get("hotkey")
     if isinstance(hotkey, str) and hotkey in HOTKEY_OPTIONS:
@@ -1075,13 +1130,79 @@ def _looks_like_prompt_echo(text, prompt):
     return False
 
 
-def _filter_result_segments(result, prompt=None):
+def _auto_gain(audio, rate):
+    """Normalize a quiet take toward a healthy speech level (AGC-lite).
+
+    Returns (audio, gain). Speech level is the 95th-percentile short-window
+    RMS so pauses and breaths don't drag the estimate down; gain is capped by
+    AUTO_GAIN_MAX and by peak headroom so nothing clips. Loud takes pass
+    through untouched (gain 1.0) — this only ever boosts.
+    """
+    if not AUTO_GAIN_ENABLED or len(audio) == 0 or rate <= 0:
+        return audio, 1.0
+    peak = float(np.max(np.abs(audio)))
+    if peak <= 1e-6:
+        return audio, 1.0
+    win = max(1, int(rate * AUTO_GAIN_WINDOW_SEC))
+    n = (len(audio) // win) * win
+    if n:
+        frames = audio[:n].reshape(-1, win)
+        level = float(np.percentile(np.sqrt(np.mean(frames * frames, axis=1)), 95))
+    else:
+        level = float(np.sqrt(np.mean(audio * audio)))
+    if level <= 1e-6 or level >= AUTO_GAIN_TARGET_RMS:
+        return audio, 1.0
+    gain = min(
+        AUTO_GAIN_TARGET_RMS / level,
+        AUTO_GAIN_MAX,
+        AUTO_GAIN_PEAK_CEILING / peak,
+    )
+    if gain <= 1.0:
+        return audio, 1.0
+    return (audio * gain).astype("float32", copy=False), gain
+
+
+def _segment_sounds_voiced(audio, rate, start, end):
+    """True if the audio inside [start, end) seconds carries real energy.
+
+    Used to rescue quiet-but-real speech from the confabulation gate: a
+    confabulated segment decodes over near-zero signal, real trailing speech
+    does not. Conservative on bad input — missing audio or garbled
+    timestamps return False, so the gate behaves exactly as before."""
+    if audio is None or rate <= 0 or len(audio) == 0:
+        return False
+    try:
+        i0 = max(0, int(float(start) * rate))
+        i1 = min(len(audio), int(float(end) * rate))
+    except (TypeError, ValueError):
+        return False
+    seg = audio[i0:i1]
+    win = max(1, int(rate * 0.03))
+    if len(seg) < max(win, int(rate * 0.05)):
+        return False
+    n_seg = (len(seg) // win) * win
+    seg_rms = np.sqrt(np.mean(seg[:n_seg].reshape(-1, win) ** 2, axis=1))
+    loud = float(np.percentile(seg_rms, 90))
+    # Whole-clip noise floor so a boosted noise bed doesn't rescue everything.
+    n_all = (len(audio) // win) * win
+    if n_all:
+        all_rms = np.sqrt(np.mean(audio[:n_all].reshape(-1, win) ** 2, axis=1))
+        floor = float(np.percentile(all_rms, 25))
+    else:
+        floor = 0.0
+    threshold = max(SEGMENT_VOICED_MIN_RMS, floor * SEGMENT_VOICED_NOISE_MULT)
+    return loud >= threshold
+
+
+def _filter_result_segments(result, prompt=None, audio=None, sample_rate=SAMPLE_RATE):
     """Re-screen Whisper's per-segment output for silence confabulations the
     built-in gates keep (see WHISPER_SEGMENT_* above): segments that sounded
-    like silence and decoded poorly, plus initial-prompt echoes. Returns
-    (text, dropped) where dropped is a list of short descriptions of the
-    discarded segments; when nothing is dropped, text is the untouched
-    whole-result text."""
+    like silence and decoded poorly, plus initial-prompt echoes. When the
+    decoded audio is supplied, a segment whose time range carries real energy
+    is kept even if it trips the gate — quiet real speech is not a
+    confabulation. Returns (text, dropped) where dropped is a list of short
+    descriptions of the discarded segments; when nothing is dropped, text is
+    the untouched whole-result text."""
     whole_text = (result.get("text") or "").strip()
     segments = result.get("segments") or []
     if not isinstance(segments, (list, tuple)):
@@ -1103,6 +1224,18 @@ def _filter_result_segments(result, prompt=None):
             no_speech > WHISPER_SEGMENT_NO_SPEECH_PROB
             and avg_logprob < WHISPER_SEGMENT_AVG_LOGPROB
         ):
+            if _segment_sounds_voiced(
+                audio, sample_rate, seg.get("start"), seg.get("end")
+            ):
+                # Real (quiet) speech tripped the silence gate — keep it and
+                # leave forensics, mirroring the segments_filtered breadcrumb.
+                _issues_append(
+                    "segment_kept_voiced",
+                    f"no_speech={no_speech:.2f} logprob={avg_logprob:.2f} "
+                    f"{seg_text[:60]!r}",
+                )
+                kept.append(seg_text)
+                continue
             dropped.append(
                 f"no_speech={no_speech:.2f} logprob={avg_logprob:.2f} {seg_text[:60]!r}"
             )
@@ -1240,6 +1373,29 @@ def _apply_silence_preset(name):
     SILENCE_DYNAMIC_MULT = float(cfg["dynamic_mult"])
 
 
+def _apply_mic_sensitivity(name):
+    """Layer the user's mic-sensitivity choice on top of the silence preset.
+
+    Must run AFTER _apply_silence_preset: the offsets/scales mutate the
+    preset's base values, so applying in the other order would compound
+    offsets across settings reloads.
+    """
+    global SILENCE_TRIM_DBFS
+    global SILENCE_DYNAMIC_MULT
+    global SILENCE_MIN_VOICED_SEC
+    global WHISPER_SEGMENT_NO_SPEECH_PROB
+    global WHISPER_SEGMENT_AVG_LOGPROB
+
+    cfg = MIC_SENSITIVITY_PRESETS.get(
+        name, MIC_SENSITIVITY_PRESETS[DEFAULT_MIC_SENSITIVITY]
+    )
+    SILENCE_TRIM_DBFS += float(cfg["dbfs_offset"])
+    SILENCE_DYNAMIC_MULT *= float(cfg["dynamic_mult_scale"])
+    SILENCE_MIN_VOICED_SEC *= float(cfg["min_voiced_scale"])
+    WHISPER_SEGMENT_NO_SPEECH_PROB = float(cfg["seg_no_speech"])
+    WHISPER_SEGMENT_AVG_LOGPROB = float(cfg["seg_avg_logprob"])
+
+
 def _apply_runtime_settings(settings, update_model=True):
     global MODEL
     global AUTO_PASTE
@@ -1255,6 +1411,7 @@ def _apply_runtime_settings(settings, update_model=True):
     LATCH_CHUNK_MODE = bool(settings["latch_chunk_mode"])
     LATCH_CHUNK_SECONDS = float(settings["latch_chunk_seconds"])
     _apply_silence_preset(settings["silence_trim_preset"])
+    _apply_mic_sensitivity(settings.get("mic_sensitivity", DEFAULT_MIC_SENSITIVITY))
 
     hotkey = HOTKEY_OPTIONS.get(settings["hotkey"], HOTKEY_OPTIONS[DEFAULT_HOTKEY])
     PTT_KEY = hotkey["pynput_key"]
@@ -3105,6 +3262,7 @@ class HistoryPanel:
         self._model_var = tk.StringVar(value=DEFAULT_MODEL)
         self._hotkey_var = tk.StringVar(value=DEFAULT_HOTKEY)
         self._silence_var = tk.StringVar(value=DEFAULT_SILENCE_PRESET)
+        self._mic_sensitivity_var = tk.StringVar(value=DEFAULT_MIC_SENSITIVITY)
         self._auto_paste_var = tk.BooleanVar(value=True)
         self._latch_mode_var = tk.BooleanVar(value=True)
         self._pill_window_var = tk.BooleanVar(value=True)
@@ -3254,6 +3412,7 @@ class HistoryPanel:
     def _current_settings_snapshot(self):
         hotkey = self._hotkey_var.get().strip()
         silence = self._silence_var.get().strip()
+        mic_sensitivity = self._mic_sensitivity_var.get().strip()
         chunk_raw = self._chunk_sec_var.get().strip()
 
         try:
@@ -3274,6 +3433,11 @@ class HistoryPanel:
             "hotkey": hotkey if hotkey in HOTKEY_OPTIONS else f"invalid:{hotkey}",
             "silence_trim_preset": (
                 silence if silence in SILENCE_PRESETS else f"invalid:{silence}"
+            ),
+            "mic_sensitivity": (
+                mic_sensitivity
+                if mic_sensitivity in MIC_SENSITIVITY_PRESETS
+                else f"invalid:{mic_sensitivity}"
             ),
             "auto_paste": bool(self._auto_paste_var.get()),
             "latch_chunk_mode": bool(self._latch_mode_var.get()),
@@ -3357,6 +3521,9 @@ class HistoryPanel:
             self._model_var.set(model)
             self._hotkey_var.set(cur.get("hotkey", DEFAULT_HOTKEY))
             self._silence_var.set(cur.get("silence_trim_preset", DEFAULT_SILENCE_PRESET))
+            self._mic_sensitivity_var.set(
+                cur.get("mic_sensitivity", DEFAULT_MIC_SENSITIVITY)
+            )
             self._auto_paste_var.set(bool(cur.get("auto_paste", True)))
             self._latch_mode_var.set(bool(cur.get("latch_chunk_mode", True)))
             self._pill_window_var.set(bool(cur.get("pill_window", True)))
@@ -3381,11 +3548,14 @@ class HistoryPanel:
         model = self._model_var.get().strip() or DEFAULT_MODEL
         hotkey = self._hotkey_var.get().strip()
         silence = self._silence_var.get().strip()
+        mic_sensitivity = self._mic_sensitivity_var.get().strip()
 
         if hotkey not in HOTKEY_OPTIONS:
             hotkey = DEFAULT_HOTKEY
         if silence not in SILENCE_PRESETS:
             silence = DEFAULT_SILENCE_PRESET
+        if mic_sensitivity not in MIC_SENSITIVITY_PRESETS:
+            mic_sensitivity = DEFAULT_MIC_SENSITIVITY
 
         try:
             chunk = float(self._chunk_sec_var.get().strip())
@@ -3405,6 +3575,7 @@ class HistoryPanel:
             "model": model,
             "hotkey": hotkey,
             "silence_trim_preset": silence,
+            "mic_sensitivity": mic_sensitivity,
             "auto_paste": bool(self._auto_paste_var.get()),
             "latch_chunk_mode": bool(self._latch_mode_var.get()),
             "latch_chunk_seconds": min(60.0, max(2.0, chunk)),
@@ -3416,6 +3587,9 @@ class HistoryPanel:
             self._model_var.set(saved["model"])
             self._hotkey_var.set(saved["hotkey"])
             self._silence_var.set(saved["silence_trim_preset"])
+            self._mic_sensitivity_var.set(
+                saved.get("mic_sensitivity", DEFAULT_MIC_SENSITIVITY)
+            )
             self._auto_paste_var.set(bool(saved["auto_paste"]))
             self._latch_mode_var.set(bool(saved["latch_chunk_mode"]))
             self._pill_window_var.set(bool(saved.get("pill_window", True)))
@@ -3787,18 +3961,28 @@ class HistoryPanel:
             row=1, column=5, sticky="w", padx=(6, 0), pady=(8, 0)
         )
 
+        ttk.Label(settings, text="Mic sensitivity").grid(
+            row=2, column=0, sticky="w", pady=(8, 0)
+        )
+        ttk.Combobox(
+            settings,
+            textvariable=self._mic_sensitivity_var,
+            values=list(MIC_SENSITIVITY_PRESETS.keys()),
+            state="readonly",
+        ).grid(row=2, column=1, sticky="ew", padx=(6, 12), pady=(8, 0))
+
         ttk.Checkbutton(
             settings,
             text="Show recording pill (restart to apply)",
             variable=self._pill_window_var,
-        ).grid(row=2, column=0, columnspan=6, sticky="w", pady=(8, 0))
+        ).grid(row=3, column=0, columnspan=6, sticky="w", pady=(8, 0))
 
         ttk.Label(settings, text="Custom Vocabulary").grid(
-            row=3, column=0, sticky="nw", pady=(10, 0)
+            row=4, column=0, sticky="nw", pady=(10, 0)
         )
         vocab_host = ttk.Frame(settings)
         vocab_host.grid(
-            row=3, column=1, columnspan=5, sticky="ew", padx=(6, 0), pady=(10, 0)
+            row=4, column=1, columnspan=5, sticky="ew", padx=(6, 0), pady=(10, 0)
         )
         vocab_host.columnconfigure(0, weight=1)
         vocab_scroll = ttk.Scrollbar(vocab_host, orient="vertical")
@@ -3816,7 +4000,7 @@ class HistoryPanel:
         ttk.Label(
             settings,
             text="One preferred word or phrase per line. These are passed to Whisper as a spelling prompt.",
-        ).grid(row=4, column=1, columnspan=5, sticky="w", pady=(6, 0))
+        ).grid(row=5, column=1, columnspan=5, sticky="w", pady=(6, 0))
 
         ttk.Label(
             outer,
@@ -3827,6 +4011,7 @@ class HistoryPanel:
             self._model_var,
             self._hotkey_var,
             self._silence_var,
+            self._mic_sensitivity_var,
             self._auto_paste_var,
             self._latch_mode_var,
             self._pill_window_var,
@@ -4498,6 +4683,7 @@ class BloopFlow:
                     "latch_chunk_mode",
                     "latch_chunk_seconds",
                     "silence_trim_preset",
+                    "mic_sensitivity",
                     "hotkey",
                     "pill_window",
                     "pill_style",
@@ -5417,6 +5603,13 @@ class BloopFlow:
         if duration < MIN_DURATION:
             return "too_short", "", duration, f"{duration:.2f}s"
 
+        # Boost quiet takes before any threshold sees them: the trim gates,
+        # Whisper's no_speech detector, and the segment filter all misread
+        # soft-spoken audio as silence. raw_rms/raw_peak above stay pre-gain
+        # on purpose — the silent-input classification asks about the mic
+        # signal, not the boosted one.
+        audio, _agc_gain = _auto_gain(audio, src_rate)
+
         work_audio = audio
         if SILENCE_TRIM_ENABLED:
             work_audio, voiced_duration = self._trim_silence(audio, src_rate)
@@ -5453,7 +5646,12 @@ class BloopFlow:
                 condition_on_previous_text=WHISPER_CONDITION_ON_PREVIOUS_TEXT,
                 initial_prompt=initial_prompt,
             )
-            text, dropped_segments = _filter_result_segments(result, initial_prompt)
+            text, dropped_segments = _filter_result_segments(
+                result,
+                initial_prompt,
+                audio=model_audio,
+                sample_rate=SAMPLE_RATE,
+            )
             if dropped_segments:
                 _issues_append(
                     "segments_filtered",

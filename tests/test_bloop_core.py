@@ -970,7 +970,11 @@ class BloopCoreTests(unittest.TestCase):
 
     def test_transcribe_audio_applies_segment_and_echo_filters(self):
         src = inspect.getsource(self.bloop.BloopFlow._transcribe_audio)
-        self.assertIn("_filter_result_segments(result, initial_prompt)", src)
+        self.assertIn("text, dropped_segments = _filter_result_segments(", src)
+        self.assertIn("result,", src)
+        self.assertIn("initial_prompt,", src)
+        self.assertIn("audio=model_audio,", src)
+        self.assertIn("sample_rate=SAMPLE_RATE,", src)
         self.assertIn("_looks_like_prompt_echo(text, initial_prompt)", src)
         self.assertIn('"segments_filtered"', src)
 
@@ -1059,6 +1063,129 @@ class BloopCoreTests(unittest.TestCase):
         concat_idx = src.index("model_audio = np.concatenate(")
         write_idx = src.index("sf.write(tmp, model_audio, SAMPLE_RATE)")
         self.assertLess(concat_idx, write_idx)
+
+    def test_mic_sensitivity_in_settings_defaults(self):
+        defaults = self.bloop._settings_defaults()
+        self.assertEqual(defaults["mic_sensitivity"], self.bloop.DEFAULT_MIC_SENSITIVITY)
+        self.assertEqual(self.bloop.DEFAULT_MIC_SENSITIVITY, "normal")
+
+    def test_mic_sensitivity_normalize_invalid_falls_back_and_valid_round_trips(self):
+        out = self.bloop._settings_normalize({"mic_sensitivity": "bogus"})
+        self.assertEqual(out["mic_sensitivity"], "normal")
+
+        out = self.bloop._settings_normalize({"mic_sensitivity": "high"})
+        self.assertEqual(out["mic_sensitivity"], "high")
+
+        out = self.bloop._settings_normalize({"mic_sensitivity": "low"})
+        self.assertEqual(out["mic_sensitivity"], "low")
+
+        # Missing key entirely also falls back to the default.
+        out = self.bloop._settings_normalize({})
+        self.assertEqual(out["mic_sensitivity"], "normal")
+
+    def test_apply_runtime_settings_applies_silence_preset_before_mic_sensitivity(self):
+        # The offsets in _apply_mic_sensitivity mutate the base values that
+        # _apply_silence_preset just set; running them in the other order
+        # would compound the offset across every settings reload instead of
+        # freshly layering it on the preset's base value each time.
+        src = inspect.getsource(self.bloop._apply_runtime_settings)
+        silence_idx = src.index("_apply_silence_preset(")
+        sensitivity_idx = src.index("_apply_mic_sensitivity(")
+        self.assertLess(silence_idx, sensitivity_idx)
+
+    def test_apply_mic_sensitivity_high_offsets_compose_on_fresh_base(self):
+        try:
+            self.bloop._apply_silence_preset("normal")
+            self.bloop._apply_mic_sensitivity("high")
+            self.assertEqual(self.bloop.WHISPER_SEGMENT_NO_SPEECH_PROB, 0.80)
+            self.assertEqual(self.bloop.SILENCE_TRIM_DBFS, -48.0)
+        finally:
+            self.bloop._apply_silence_preset(self.bloop.DEFAULT_SILENCE_PRESET)
+            self.bloop._apply_mic_sensitivity(self.bloop.DEFAULT_MIC_SENSITIVITY)
+
+    def test_mic_sensitivity_presets_all_keys_and_directionality(self):
+        presets = self.bloop.MIC_SENSITIVITY_PRESETS
+        for key in ("high", "normal", "low"):
+            self.assertIn(key, presets)
+
+        high = presets["high"]
+        normal = presets["normal"]
+        low = presets["low"]
+
+        # "high" favors picking up quiet speech: looser (more permissive)
+        # gates than normal, and a negative dbfs offset (lower trim
+        # threshold = trims less aggressively).
+        self.assertGreater(high["seg_no_speech"], normal["seg_no_speech"])
+        self.assertLess(high["dbfs_offset"], 0.0)
+
+        # "low" favors suppressing noise in loud rooms: the reverse.
+        self.assertLess(low["seg_no_speech"], normal["seg_no_speech"])
+        self.assertGreater(low["dbfs_offset"], 0.0)
+
+    def test_auto_gain_constants(self):
+        self.assertTrue(self.bloop.AUTO_GAIN_ENABLED)
+        self.assertGreater(self.bloop.AUTO_GAIN_MAX, 1.0)
+        self.assertLess(self.bloop.AUTO_GAIN_PEAK_CEILING, 1.0)
+
+    def test_transcribe_audio_calls_auto_gain_after_min_duration_before_trim(self):
+        src = inspect.getsource(self.bloop.BloopFlow._transcribe_audio)
+        min_duration_idx = src.index("if duration < MIN_DURATION:")
+        rms_idx = src.index("raw_rms = float(")
+        auto_gain_idx = src.index("audio, _agc_gain = _auto_gain(audio, src_rate)")
+        trim_idx = src.index("work_audio, voiced_duration = self._trim_silence(")
+
+        # raw_rms/raw_peak measure the untouched mic signal, so they must be
+        # computed before the gain boost is applied.
+        self.assertLess(rms_idx, auto_gain_idx)
+        # The MIN_DURATION short-circuit must happen before any processing.
+        self.assertLess(min_duration_idx, auto_gain_idx)
+        # Auto-gain must run before silence trimming sees the audio.
+        self.assertLess(auto_gain_idx, trim_idx)
+
+    def test_filter_result_segments_energy_rescue_keeps_voiced_segment(self):
+        result = {
+            "text": "quiet real speech",
+            "segments": [
+                {
+                    "text": "quiet real speech",
+                    "no_speech_prob": 0.9,
+                    "avg_logprob": -0.9,
+                    "start": 0.0,
+                    "end": 1.0,
+                },
+            ],
+        }
+
+        # Old behavior preserved: with no audio supplied, the gate drops the
+        # segment exactly as before this feature existed.
+        text, dropped = self.bloop._filter_result_segments(result, None)
+        self.assertEqual(text, "")
+        self.assertEqual(len(dropped), 1)
+
+        orig_voiced = self.bloop._segment_sounds_voiced
+        orig_issues_append = self.bloop._issues_append
+        captured = []
+
+        def fake_segment_sounds_voiced(*_args, **_kwargs):
+            return True
+
+        def fake_issues_append(*args, **kwargs):
+            captured.append((args, kwargs))
+
+        self.bloop._segment_sounds_voiced = fake_segment_sounds_voiced
+        self.bloop._issues_append = fake_issues_append
+        try:
+            text2, dropped2 = self.bloop._filter_result_segments(
+                result, None, audio=object(), sample_rate=16000
+            )
+        finally:
+            self.bloop._segment_sounds_voiced = orig_voiced
+            self.bloop._issues_append = orig_issues_append
+
+        self.assertEqual(text2, "quiet real speech")
+        self.assertEqual(dropped2, [])
+        self.assertTrue(captured, "expected a segment_kept_voiced breadcrumb")
+        self.assertEqual(captured[0][0][0], "segment_kept_voiced")
 
 
 if __name__ == "__main__":

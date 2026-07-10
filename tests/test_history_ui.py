@@ -95,6 +95,28 @@ class HistoryUiTests(unittest.TestCase):
         self.assertEqual(out["pill_style"], "bubbles")
         self.assertIn('id="s-pillstyle"', self.ui.HTML)
 
+    def test_mic_sensitivity_normalize_and_form(self):
+        out = self.ui._settings_normalize({"mic_sensitivity": "high"})
+        self.assertEqual(out["mic_sensitivity"], "high")
+        out = self.ui._settings_normalize({"mic_sensitivity": "low"})
+        self.assertEqual(out["mic_sensitivity"], "low")
+        out = self.ui._settings_normalize({"mic_sensitivity": "bogus"})
+        self.assertEqual(out["mic_sensitivity"], "normal")
+        out = self.ui._settings_normalize({})
+        self.assertEqual(out["mic_sensitivity"], "normal")
+
+        self.assertIn('id="s-sensitivity"', self.ui.HTML)
+        self.assertIn("mic_sensitivity: document.getElementById('s-sensitivity').value", self.ui.HTML)
+        self.assertIn("s-sensitivity", self.ui.HTML)
+
+    def test_mic_sensitivity_save_round_trip_keeps_value(self):
+        saved = self.ui._settings_save({"mic_sensitivity": "low"})
+        self.assertEqual(saved["mic_sensitivity"], "low")
+        # A later save that doesn't mention mic_sensitivity must not reset it,
+        # mirroring the pill_window regression test above.
+        saved = self.ui._settings_save({"auto_paste": False})
+        self.assertEqual(saved["mic_sensitivity"], "low")
+
 
 if __name__ == "__main__":
     unittest.main()

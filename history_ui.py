@@ -55,12 +55,14 @@ _SETTINGS_DEFAULTS = {
     "latch_chunk_mode": True,
     "latch_chunk_seconds": 10.0,
     "silence_trim_preset": "normal",
+    "mic_sensitivity": "normal",
     "hotkey": "right_cmd",
     "pill_window": True,
     "pill_style": "bubbles",
     "custom_vocab": ["Blooop"],
 }
 _SILENCE_PRESETS = {"off", "normal", "aggressive"}
+_MIC_SENSITIVITIES = {"high", "normal", "low"}
 _HOTKEYS = {"right_cmd", "right_option", "right_shift"}
 _PILL_STYLES = {"bubbles", "spectrogram"}
 
@@ -285,6 +287,10 @@ def _settings_normalize(raw):
     silence = raw.get("silence_trim_preset")
     if isinstance(silence, str) and silence in _SILENCE_PRESETS:
         out["silence_trim_preset"] = silence
+
+    mic_sensitivity = raw.get("mic_sensitivity")
+    if isinstance(mic_sensitivity, str) and mic_sensitivity in _MIC_SENSITIVITIES:
+        out["mic_sensitivity"] = mic_sensitivity
 
     hotkey = raw.get("hotkey")
     if isinstance(hotkey, str) and hotkey in _HOTKEYS:
@@ -885,6 +891,15 @@ body {
     </div>
 
     <div class="field">
+      <label for="s-sensitivity">Mic sensitivity</label>
+      <select id="s-sensitivity">
+        <option value="high">High (picks up quiet speech)</option>
+        <option value="normal">Normal</option>
+        <option value="low">Low (noisy rooms)</option>
+      </select>
+    </div>
+
+    <div class="field">
       <label>Auto-paste</label>
       <div class="check-row">
         <input type="checkbox" id="s-auto-paste">
@@ -1052,6 +1067,7 @@ function readSettingsForm() {
     model: document.getElementById('s-model').value,
     hotkey: document.getElementById('s-hotkey').value,
     silence_trim_preset: document.getElementById('s-silence').value,
+    mic_sensitivity: document.getElementById('s-sensitivity').value,
     auto_paste: !!document.getElementById('s-auto-paste').checked,
     latch_chunk_mode: !!document.getElementById('s-latch-mode').checked,
     latch_chunk_seconds: sec,
@@ -1074,6 +1090,10 @@ function applySettingsForm(s) {
   const silSel = document.getElementById('s-silence');
   if ([...silSel.options].some(o => o.value === s.silence_trim_preset)) {
     silSel.value = s.silence_trim_preset;
+  }
+  const sensSel = document.getElementById('s-sensitivity');
+  if ([...sensSel.options].some(o => o.value === s.mic_sensitivity)) {
+    sensSel.value = s.mic_sensitivity;
   }
   document.getElementById('s-auto-paste').checked = !!s.auto_paste;
   document.getElementById('s-latch-mode').checked = !!s.latch_chunk_mode;
@@ -1332,8 +1352,8 @@ function initSettingsBindings() {
   const btn = document.getElementById('settings-toggle');
   if (btn) btn.addEventListener('click', toggleSettingsPanel);
 
-  const ids = ['s-model', 's-hotkey', 's-silence', 's-auto-paste', 's-latch-mode',
-               's-chunk-sec', 's-pill', 's-pillstyle', 's-vocab'];
+  const ids = ['s-model', 's-hotkey', 's-silence', 's-sensitivity', 's-auto-paste',
+               's-latch-mode', 's-chunk-sec', 's-pill', 's-pillstyle', 's-vocab'];
   ids.forEach((id) => {
     const el = document.getElementById(id);
     if (!el) return;
