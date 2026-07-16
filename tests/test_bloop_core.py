@@ -1,10 +1,12 @@
 import importlib.util
 import inspect
+import json
 import os
 from pathlib import Path
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 
@@ -225,10 +227,14 @@ class BloopCoreTests(unittest.TestCase):
         src = inspect.getsource(self.bloop.HistoryPanel._refresh_rows)
         self.assertIn("preview, _truncated = _history_summary(", src)
 
-    def test_prewarm_has_tmpfile_cleanup(self):
+    def test_prewarm_feeds_whisper_the_array_directly(self):
+        # No temp WAV round-trip: mlx_whisper's str/path input mode is the
+        # only one that needs ffmpeg, and the standalone .app must not
+        # depend on a Homebrew ffmpeg being installed.
         src = inspect.getsource(self.bloop.BloopFlow._prewarm)
-        self.assertIn("tmp = None", src)
-        self.assertIn("if tmp is not None", src)
+        self.assertNotIn("tempfile", src)
+        self.assertNotIn("sf.write", src)
+        self.assertIn("self._whisper.transcribe(\n                silent,", src)
 
     def test_custom_vocab_prompt_contains_exact_spellings(self):
         prompt = self.bloop._custom_vocab_initial_prompt(["Blooop", "Codex"])
@@ -447,10 +453,14 @@ class BloopCoreTests(unittest.TestCase):
         self.assertIn("self.post_to_ui(lambda: cb(mode))", src)
 
     def test_hotkey_callbacks_are_marshaled_to_visualizer_queue(self):
-        src = inspect.getsource(self.bloop.BloopFlow.run)
+        # Monitor construction moved from run() into _start_hotkey_monitor so
+        # the onboarding wizard can lazy-start it when AX flips to granted.
+        src = inspect.getsource(self.bloop.BloopFlow._start_hotkey_monitor)
         self.assertIn("schedule=self._viz.post_to_ui", src)
-        self.assertIn("self._viz.post_to_ui(cb)", src)
         self.assertNotIn("schedule=lambda cb: tk_root.after(0, cb)", src)
+        src = inspect.getsource(self.bloop.BloopFlow.run)
+        self.assertIn("self._start_hotkey_monitor()", src)
+        self.assertIn("self._viz.post_to_ui(cb)", src)
 
     def test_pynput_callbacks_are_marshaled_to_visualizer_queue(self):
         src = inspect.getsource(self.bloop.BloopFlow._on_press)
@@ -783,12 +793,18 @@ class BloopCoreTests(unittest.TestCase):
         self.assertIn("self._open_input_stream()", src)
 
     def test_whisper_warmup_serializes_with_transcribe_worker(self):
-        # Warmup inference runs on the Tk main thread while the worker thread
-        # is already live; without the lock a recording finished mid-warmup
-        # put two threads inside MLX/Metal at once (intermittent abort).
-        src = inspect.getsource(self.bloop.BloopFlow._prepare_whisper_runtime)
+        # Warmup inference runs while the worker thread is already live;
+        # without the lock a recording finished mid-warmup put two threads
+        # inside MLX/Metal at once (intermittent abort). The warmup body now
+        # lives in _warmup_whisper (shared by the boot path and the
+        # post-download worker job) and _prepare_whisper_runtime must still
+        # route through it.
+        src = inspect.getsource(self.bloop.BloopFlow._warmup_whisper)
         self.assertIn("self._tx_lock.acquire()", src)
         self.assertIn("self._tx_lock.release()", src)
+        src = inspect.getsource(self.bloop.BloopFlow._prepare_whisper_runtime)
+        self.assertIn("self._warmup_whisper()", src)
+        self.assertIn("self._init_mlx_core_main_thread()", src)
 
     def test_release_transcribe_memory_prefers_modern_clear_cache(self):
         src = inspect.getsource(self.bloop.BloopFlow._release_transcribe_memory)
@@ -1058,11 +1074,14 @@ class BloopCoreTests(unittest.TestCase):
             "np.zeros(int(SAMPLE_RATE * WHISPER_TAIL_PAD_SEC), dtype=\"float32\")",
             src,
         )
-        # The padded array must be what actually gets written to the wav
-        # fed to Whisper, not a discarded local.
+        # The padded array must be what is actually fed to Whisper (passed
+        # directly — no ffmpeg/WAV round-trip), not a discarded local.
         concat_idx = src.index("model_audio = np.concatenate(")
-        write_idx = src.index("sf.write(tmp, model_audio, SAMPLE_RATE)")
-        self.assertLess(concat_idx, write_idx)
+        transcribe_idx = src.index("result = w.transcribe(")
+        self.assertLess(concat_idx, transcribe_idx)
+        arg_idx = src.index("model_audio,", transcribe_idx)
+        self.assertLess(arg_idx, src.index("path_or_hf_repo", transcribe_idx))
+        self.assertNotIn("sf.write", src)
 
     def test_mic_sensitivity_in_settings_defaults(self):
         defaults = self.bloop._settings_defaults()
@@ -1186,6 +1205,643 @@ class BloopCoreTests(unittest.TestCase):
         self.assertEqual(dropped2, [])
         self.assertTrue(captured, "expected a segment_kept_voiced breadcrumb")
         self.assertEqual(captured[0][0][0], "segment_kept_voiced")
+
+    def test_model_is_available_probes_hf_cache_without_network(self):
+        # Fresh-install online, the old warmup call itself triggered a silent
+        # BLOCKING full-model download. Availability must be answerable
+        # cheaply: bundled dir, else a local_files_only cache probe (raises
+        # instead of touching the network when files are missing).
+        src = inspect.getsource(self.bloop.BloopFlow._model_is_available)
+        self.assertIn("local_files_only=True", src)
+        self.assertIn("_bundled_model_path(", src)
+        self.assertIn("snapshot_download(", src)
+
+        # Behavioral: no bundle + no HF cache in the temp HOME -> unavailable.
+        flow = object.__new__(self.bloop.BloopFlow)
+        self.assertFalse(flow._model_is_available("mlx-community/does-not-exist"))
+        self.assertFalse(flow._model_is_available(""))
+
+    def test_model_is_available_rejects_partial_hf_cache(self):
+        # huggingface_hub's local_files_only probe returns the snapshot dir
+        # as soon as refs/main and the first small file exist — an
+        # interrupted first download (config.json landed, weights didn't)
+        # must NOT count as available, or boot re-schedules the blocking
+        # main-thread warmup download this machinery exists to prevent.
+        from huggingface_hub import constants as hf_constants
+
+        repo = "mlx-community/blooop-partial-test"
+        cache_repo = os.path.join(
+            hf_constants.HF_HUB_CACHE, "models--mlx-community--blooop-partial-test"
+        )
+        commit = "0" * 40
+        snap = os.path.join(cache_repo, "snapshots", commit)
+        os.makedirs(os.path.join(cache_repo, "refs"), exist_ok=True)
+        os.makedirs(snap, exist_ok=True)
+        try:
+            with open(os.path.join(cache_repo, "refs", "main"), "w") as fh:
+                fh.write(commit)
+            with open(os.path.join(snap, "config.json"), "w") as fh:
+                fh.write("{}")
+
+            flow = object.__new__(self.bloop.BloopFlow)
+            # Partial cache: config.json only, weights missing -> unavailable.
+            self.assertFalse(flow._model_is_available(repo))
+            # Weights landed -> available (either weights filename counts).
+            with open(os.path.join(snap, "weights.npz"), "w") as fh:
+                fh.write("x")
+            self.assertTrue(flow._model_is_available(repo))
+        finally:
+            import shutil
+
+            shutil.rmtree(cache_repo, ignore_errors=True)
+
+    def test_boot_warmup_is_gated_on_model_availability(self):
+        # Warmup blocks on a full-model download when the model isn't on
+        # disk; boot must check availability first and route the unavailable
+        # case through the download machinery instead of scheduling warmup.
+        src = inspect.getsource(self.bloop.BloopFlow.run)
+        self.assertIn("self._model_is_available(self._runtime_model)", src)
+        self.assertIn("self._queue_model_download(self._runtime_model)", src)
+        self.assertIn("self._viz.root.after(120, self._prepare_whisper_runtime)", src)
+        self.assertIn("self._viz.root.after(120, self._init_mlx_core_main_thread)", src)
+        gate_idx = src.index("self._model_is_available(self._runtime_model)")
+        warmup_idx = src.index("self._viz.root.after(120, self._prepare_whisper_runtime)")
+        self.assertLess(gate_idx, warmup_idx)
+
+    def test_boot_download_completion_warms_up_without_relaunch_offer(self):
+        # Boot fill (downloading the runtime model itself) must NOT offer a
+        # relaunch — nothing is loaded yet. Warmup is queued as a job on the
+        # transcribe worker, which is safe because mlx.core was already
+        # imported on the main thread.
+        src = inspect.getsource(self.bloop.BloopFlow._model_download_loop)
+        self.assertIn("boot_fill = target == self._runtime_model", src)
+        self.assertIn("self._transcribe_queue.put(self._finish_boot_model_fill)", src)
+        # The boot-fill success branch must queue warmup, not offer relaunch:
+        # between "if boot_fill:" and its "else:" there is no relaunch offer.
+        boot_idx = src.index("if boot_fill:")
+        else_idx = src.index("else:", boot_idx)
+        self.assertNotIn("_offer_model_relaunch", src[boot_idx:else_idx])
+        self.assertIn(
+            "self._transcribe_queue.put(self._finish_boot_model_fill)",
+            src[boot_idx:else_idx],
+        )
+        src = inspect.getsource(self.bloop.BloopFlow._transcribe_worker)
+        self.assertIn("if callable(job):", src)
+        src = inspect.getsource(self.bloop.BloopFlow._finish_boot_model_fill)
+        self.assertIn("self._warmup_whisper()", src)
+
+    def test_finish_boot_model_fill_only_retires_its_own_state(self):
+        # The warmup job runs for seconds on the transcribe worker; a model
+        # switch queued meanwhile owns the download state, and finishing the
+        # boot fill must not stomp it back to idle (hiding the progress bar,
+        # or a quick failure's Retry button).
+        bloop = self.bloop
+
+        def make_flow(state, target):
+            flow = object.__new__(bloop.BloopFlow)
+            flow._model_dl_lock = threading.Lock()
+            flow._model_dl_state = state
+            flow._model_dl_target = target
+            flow._model_dl_error = "boom" if state == "failed" else None
+            flow._runtime_model = "mlx-community/whisper-tiny-mlx"
+            flow._warmup_whisper = lambda: None
+            flow._publish_runtime_status = lambda: None
+            return flow
+
+        # Own boot fill: downloaded + target == runtime model -> retired.
+        flow = make_flow("downloaded", "mlx-community/whisper-tiny-mlx")
+        flow._finish_boot_model_fill()
+        self.assertEqual(flow._model_dl_state, "idle")
+        self.assertIsNone(flow._model_dl_target)
+        self.assertIsNone(flow._model_dl_error)
+
+        # A second download in flight (or failed) is left untouched.
+        for state in ("queued", "downloading", "failed", "downloaded"):
+            flow = make_flow(state, "mlx-community/whisper-large-v3-mlx")
+            flow._finish_boot_model_fill()
+            self.assertEqual(flow._model_dl_state, state)
+            self.assertEqual(
+                flow._model_dl_target, "mlx-community/whisper-large-v3-mlx"
+            )
+
+    def test_start_recording_refuses_while_model_downloading(self):
+        bloop = self.bloop
+        flow = object.__new__(bloop.BloopFlow)
+        flow._audio_wedged = False
+        flow._mlx_runtime_ok = True
+        flow._model_ready = False
+        flow._model_dl_lock = threading.Lock()
+        flow._model_dl_state = "downloading"
+        flow._model_dl_thread = None
+        flow._model_dl_progress = {
+            "percent": 43, "downloaded_mb": 200, "total_mb": 460,
+        }
+        # Double-tap arms latch before start_recording runs; the refusal must
+        # disarm it, or the next press hits the latched branch and prints
+        # "Stopped." instead of retrying.
+        flow.latched = True
+        printed = []
+        flow._print = printed.append
+        requeued = []
+        flow._queue_model_download = requeued.append
+
+        flow.start_recording()
+        self.assertEqual(len(printed), 1)
+        self.assertIn("Downloading the transcription model (43%)", printed[0])
+        self.assertEqual(requeued, [])
+        self.assertFalse(flow.latched)
+
+        # Indeterminate progress -> no percent in the message.
+        flow._model_dl_progress = None
+        printed.clear()
+        flow.start_recording()
+        self.assertIn("Downloading the transcription model —", printed[0])
+
+    def test_start_recording_retries_failed_boot_download_on_hotkey(self):
+        bloop = self.bloop
+        flow = object.__new__(bloop.BloopFlow)
+        flow._audio_wedged = False
+        flow._mlx_runtime_ok = True
+        flow._model_ready = False
+        flow._model_dl_lock = threading.Lock()
+        flow._model_dl_state = "failed"
+        flow._model_dl_thread = None
+        flow._model_dl_progress = None
+        flow._runtime_model = "mlx-community/whisper-tiny-mlx"
+        flow.latched = True
+        printed = []
+        flow._print = printed.append
+        requeued = []
+        flow._queue_model_download = requeued.append
+
+        flow.start_recording()
+        self.assertEqual(requeued, ["mlx-community/whisper-tiny-mlx"])
+        self.assertIn("retrying", printed[0])
+        # The armed double-tap latch must not swallow the next retry press.
+        self.assertFalse(flow.latched)
+
+    def test_runtime_status_publishes_model_download_progress(self):
+        src = inspect.getsource(self.bloop.BloopFlow._publish_runtime_status)
+        self.assertIn('"model_download_progress": self._model_dl_progress', src)
+        self.assertIn('"model_ready": self._model_ready', src)
+        # The progress dict shape the webview relies on.
+        src = inspect.getsource(self.bloop.BloopFlow._on_model_dl_progress)
+        for key in ('"percent"', '"downloaded_mb"', '"total_mb"'):
+            self.assertIn(key, src)
+        # _publish_runtime_status is called while _queue_model_download holds
+        # _model_dl_lock, so it must never take that lock itself.
+        pub_src = inspect.getsource(self.bloop.BloopFlow._publish_runtime_status)
+        self.assertNotIn("with self._model_dl_lock", pub_src)
+
+    def test_model_download_tqdm_reports_aggregate_bytes(self):
+        # huggingface_hub 1.4.1 funnels every per-file update into one
+        # aggregate bytes bar (unit="B"); the tqdm_class only needs to mirror
+        # that bar out through the session callback and stay quiet otherwise.
+        cls = self.bloop._ModelDownloadTqdm
+        self.assertIsNotNone(cls)
+        seen = []
+        cls.begin_session(lambda n, total: seen.append((n, total)))
+        try:
+            bar = cls(desc="Downloading", total=0, initial=0, unit="B",
+                      unit_scale=True, name="huggingface_hub.snapshot_download")
+            bar.total += 100  # hf grows the total as file metadata arrives
+            bar.update(25)
+            bar.update(25)
+            files_bar = cls(desc="Fetching 3 files", total=3)
+            files_bar.update(1)  # files-count bar must not pollute byte counts
+            bar.close()
+        finally:
+            cls.end_session()
+        self.assertIn((25, 100), seen)
+        self.assertIn((50, 100), seen)
+        self.assertEqual(seen[-1], (50, 100))
+
+    def test_spec_gates_bundled_models_behind_env_flag(self):
+        spec_text = (REPO_ROOT / "Blooop.spec").read_text(encoding="utf-8")
+        self.assertIn(
+            'os.environ.get("BLOOOP_BUNDLE_MODELS") == "1"', spec_text
+        )
+        # A stale local bundled-models/ dir alone must not be enough.
+        self.assertNotIn('if os.path.isdir("bundled-models"):', spec_text)
+
+    def test_spec_excludes_torch_but_keeps_numba_scipy(self):
+        spec_text = (REPO_ROOT / "Blooop.spec").read_text(encoding="utf-8")
+        self.assertIn('excludes=["torch", "torchgen", "functorch"]', spec_text)
+        # mlx_whisper.transcribe imports .timing at module import time, which
+        # needs numba (and its llvmlite) plus scipy — they must stay.
+        self.assertNotIn('"numba"', spec_text.split("excludes=")[1].split("]")[0])
+        self.assertNotIn('"scipy"', spec_text.split("excludes=")[1].split("]")[0])
+
+    def test_build_script_gates_model_bundling_behind_flag(self):
+        script = (REPO_ROOT / "build_app.sh").read_text(encoding="utf-8")
+        self.assertIn("--bundle-models) BUNDLE_MODELS=1 ;;", script)
+        self.assertIn("export BLOOOP_BUNDLE_MODELS=1", script)
+        export_idx = script.index("export BLOOOP_BUNDLE_MODELS=1")
+        gate_idx = script.index('if [ "$BUNDLE_MODELS" -eq 1 ]; then')
+        self.assertGreater(export_idx, gate_idx)
+
+    def test_onboarding_paths_follow_state_dir(self):
+        self.assertEqual(
+            self.bloop.ONBOARDING_STATE_PATH,
+            os.path.join(self.bloop.STATE_DIR, "onboarding_state.json"),
+        )
+        self.assertEqual(
+            self.bloop.UI_COMMAND_FILE,
+            os.path.join(self.bloop.STATE_DIR, "ui_command.json"),
+        )
+
+    def test_onboarding_marker_round_trip(self):
+        # Behavioral: marker absent -> {}, mark_done -> onboarded True with a
+        # completion timestamp, and the write is what the loader reads back.
+        try:
+            os.unlink(self.bloop.ONBOARDING_STATE_PATH)
+        except OSError:
+            pass
+        self.assertEqual(self.bloop._onboarding_state_load(), {})
+        out = self.bloop._onboarding_mark_done()
+        self.assertIs(out["onboarded"], True)
+        loaded = self.bloop._onboarding_state_load()
+        self.assertIs(loaded["onboarded"], True)
+        self.assertIn("completed_at", loaded)
+        os.unlink(self.bloop.ONBOARDING_STATE_PATH)
+
+    def test_boot_grandfathers_existing_installs_past_onboarding(self):
+        # Upgrading users (mic + AX granted, NO marker file) must never see
+        # the wizard: boot writes the marker and proceeds exactly as today.
+        # Model availability must NOT gate this — users upgrading from
+        # bundled-model builds have both permissions but an empty HF cache
+        # (their model lived inside the .app they just replaced); they get
+        # the background download and the settings progress bar, not the
+        # wizard. An EXISTING marker disables the grandfather rule entirely:
+        # in-progress means a mid-wizard relaunch, and the wizard resumes
+        # regardless of permissions.
+        src = inspect.getsource(self.bloop.BloopFlow.run)
+        gate_idx = src.index('_onboarding_state_load().get("onboarded")')
+        grandfather_idx = src.index("_onboarding_mark_done()")
+        self.assertLess(gate_idx, grandfather_idx)
+        cond = src[gate_idx:grandfather_idx]
+        self.assertIn("not os.path.exists(ONBOARDING_STATE_PATH)", cond)
+        self.assertIn('self._mic_status == "granted"', cond)
+        self.assertIn('self._ax_status == "granted"', cond)
+        self.assertNotIn("self._model_is_available(self._runtime_model)", cond)
+        # Only a panel that can actually show the wizard may enter onboarding
+        # mode — the Tk fallback panel has no wizard, and onboarding mode
+        # without one suppresses the legacy permission prompts forever.
+        gate = src[:gate_idx]
+        self.assertIn(
+            'callable(getattr(self._history_panel, "show_onboarding", None))',
+            gate,
+        )
+
+    def test_onboarding_boot_skips_blunt_permission_prompts(self):
+        # While the wizard drives permissions, boot must run only the
+        # non-prompting probes — no TCC/AX dialogs, no blocking osascript
+        # alert, no auto-opened System Settings.
+        src = inspect.getsource(self.bloop.BloopFlow.run)
+        self.assertIn("self._mic_permission_status()", src)
+        self.assertIn("self._ax_permission_status()", src)
+        onboarding_branch = src.index('mic_ok = self._mic_status == "granted"')
+        prompting_branch = src.index("mic_ok = self._check_microphone_permission()")
+        self.assertLess(onboarding_branch, prompting_branch)
+        self.assertIn("self._begin_onboarding()", src)
+        # The wizard opens after the panel exists, so the seq bump is seen.
+        self.assertLess(
+            src.index("self._history_panel.start()"),
+            src.index("self._begin_onboarding()"),
+        )
+
+    def test_permission_probes_are_non_prompting(self):
+        src = inspect.getsource(self.bloop.BloopFlow._mic_permission_status)
+        self.assertIn("authorizationStatusForMediaType_", src)
+        self.assertNotIn("requestAccessForMediaType_", src)
+        src = inspect.getsource(self.bloop.BloopFlow._ax_permission_status)
+        self.assertIn("AXIsProcessTrusted", src)
+        self.assertNotIn("AXIsProcessTrustedWithOptions", src)
+
+    def test_ui_command_allowlist_and_dedupe(self):
+        self.assertEqual(
+            self.bloop.ONBOARDING_COMMANDS,
+            frozenset({
+                "request_mic", "request_ax", "open_privacy_mic",
+                "open_privacy_ax", "retry_model_download", "finish_onboarding",
+                "restart_onboarding", "relaunch_app",
+            }),
+        )
+        src = inspect.getsource(self.bloop.BloopFlow._ui_command_watch_loop)
+        self.assertIn("ONBOARDING_COMMANDS", src)
+        self.assertIn("seq <= self._ui_cmd_seq", src)
+        # The watcher drains the pending queue, not just the newest slot.
+        self.assertIn('raw.get("pending")', src)
+        # A stale command file from a previous session must never replay at
+        # boot (worst case: a leftover relaunch_app -> relaunch loop).
+        src = inspect.getsource(self.bloop.BloopFlow._start_ui_command_watch)
+        self.assertIn("self._ui_cmd_seq = self._ui_command_seq_snapshot()", src)
+        # Every allowlisted command has a dispatch branch.
+        src = inspect.getsource(self.bloop.BloopFlow._handle_ui_command)
+        for name in self.bloop.ONBOARDING_COMMANDS:
+            self.assertIn(f'"{name}"', src)
+
+    def test_ui_command_watch_drains_pending_queue(self):
+        # Two wizard buttons clicked within one 500ms poll window both land
+        # in ui_command.json's pending queue; the watcher must process both
+        # in order — a single {seq, command} slot dropped the first click
+        # silently (e.g. request_ax lost under open_privacy_ax).
+        bloop = self.bloop
+        flow = object.__new__(bloop.BloopFlow)
+        flow._ui_cmd_stop = threading.Event()
+        flow._ui_cmd_seq = 0
+        handled = []
+
+        def handle(name):
+            handled.append(name)
+            if len(handled) >= 2:
+                flow._ui_cmd_stop.set()
+
+        flow._handle_ui_command = handle
+        os.makedirs(os.path.dirname(bloop.UI_COMMAND_FILE), exist_ok=True)
+        try:
+            with open(bloop.UI_COMMAND_FILE, "w", encoding="utf-8") as fh:
+                json.dump(
+                    {
+                        "seq": 2,
+                        "command": "open_privacy_ax",
+                        "pending": [
+                            {"seq": 1, "command": "request_ax"},
+                            {"seq": 2, "command": "open_privacy_ax"},
+                        ],
+                    },
+                    fh,
+                )
+            safety = threading.Timer(3.0, flow._ui_cmd_stop.set)
+            safety.daemon = True
+            safety.start()
+            watcher = threading.Thread(
+                target=flow._ui_command_watch_loop, daemon=True
+            )
+            watcher.start()
+            watcher.join(timeout=4.0)
+            safety.cancel()
+        finally:
+            try:
+                os.unlink(bloop.UI_COMMAND_FILE)
+            except OSError:
+                pass
+        self.assertEqual(handled, ["request_ax", "open_privacy_ax"])
+        self.assertEqual(flow._ui_cmd_seq, 2)
+
+    def test_finish_onboarding_writes_marker_and_stops_poll(self):
+        bloop = self.bloop
+        try:
+            os.unlink(bloop.ONBOARDING_STATE_PATH)
+        except OSError:
+            pass
+        flow = object.__new__(bloop.BloopFlow)
+        flow._onboarding_active = True
+        flow._onboarding_stop = threading.Event()
+        flow._status_publish_stopped = False
+        flow._mic_status = "granted"
+        flow._ax_status = "granted"
+        flow._hotkey_ready = True
+        flow._model_ready = True
+        flow._runtime_model = bloop.DEFAULT_MODEL
+        flow._requested_model = bloop.DEFAULT_MODEL
+        flow._model_dl_state = "idle"
+        flow._model_dl_target = None
+        flow._model_dl_error = None
+        flow._model_dl_progress = None
+        printed = []
+        flow._print = printed.append
+
+        flow._finish_onboarding()
+        self.assertFalse(flow._onboarding_active)
+        self.assertTrue(flow._onboarding_stop.is_set())
+        self.assertIs(bloop._onboarding_state_load()["onboarded"], True)
+        os.unlink(bloop.ONBOARDING_STATE_PATH)
+
+    def test_restart_onboarding_reopens_wizard_without_dropping_marker(self):
+        # Deleting the marker would re-arm the boot grandfather rule: a
+        # relaunch mid-rerun would then silently mark the install onboarded.
+        # Restart goes through _begin_onboarding, which rewrites the marker
+        # as in-progress instead.
+        src = inspect.getsource(self.bloop.BloopFlow._restart_onboarding)
+        self.assertNotIn("os.unlink", src)
+        self.assertIn("self._begin_onboarding()", src)
+        src = inspect.getsource(self.bloop.BloopFlow._begin_onboarding)
+        self.assertIn("_onboarding_mark_in_progress()", src)
+
+    def test_runtime_status_publishes_onboarding_fields(self):
+        src = inspect.getsource(self.bloop.BloopFlow._publish_runtime_status)
+        for key in (
+            '"onboarding_active"', '"mic_status"', '"ax_status"',
+            '"hotkey_ready"',
+        ):
+            self.assertIn(key, src)
+
+    def test_ax_grant_mid_onboarding_lazy_starts_hotkey(self):
+        src = inspect.getsource(self.bloop.BloopFlow._onboarding_status_loop)
+        self.assertIn('self._ax_status == "granted" and not self._hotkey_ready', src)
+        self.assertIn("self._start_hotkey_monitor", src)
+        # The lazy start mirrors boot exactly: AppKit first, pynput fallback.
+        src = inspect.getsource(self.bloop.BloopFlow._start_hotkey_monitor)
+        self.assertIn("MacCommandHotkeyMonitor(", src)
+        self.assertIn("keyboard.Listener(", src)
+
+    def test_webview_panel_write_command_includes_onboarding_seq(self):
+        src = inspect.getsource(self.bloop.WebviewHistoryPanel._write_command)
+        self.assertIn('"onboarding_seq": self._onboarding_seq', src)
+        src = inspect.getsource(self.bloop.WebviewHistoryPanel.show_onboarding)
+        self.assertIn("self._onboarding_seq += 1", src)
+
+    def test_onboarding_marker_in_progress_round_trip(self):
+        # Three-state marker: in-progress means a wizard was started but not
+        # finished (mid-wizard relaunch must resume it), and mark_done
+        # overwrites it. started_at survives a re-begin (wizard resume).
+        bloop = self.bloop
+        try:
+            os.unlink(bloop.ONBOARDING_STATE_PATH)
+        except OSError:
+            pass
+        out = bloop._onboarding_mark_in_progress()
+        self.assertIs(out["onboarded"], False)
+        self.assertIs(out["in_progress"], True)
+        started = out["started_at"]
+        self.assertTrue(started)
+        loaded = bloop._onboarding_state_load()
+        self.assertIs(loaded["onboarded"], False)
+        self.assertIs(loaded["in_progress"], True)
+        # Resuming (begin again) keeps the original start timestamp.
+        again = bloop._onboarding_mark_in_progress()
+        self.assertEqual(again["started_at"], started)
+        # Finishing overwrites with the done state — and a pre-existing
+        # {"onboarded": true} file (older builds) still reads as done.
+        bloop._onboarding_mark_done()
+        loaded = bloop._onboarding_state_load()
+        self.assertIs(loaded["onboarded"], True)
+        self.assertNotIn("in_progress", loaded)
+        os.unlink(bloop.ONBOARDING_STATE_PATH)
+
+    def _make_download_flow(self):
+        bloop = self.bloop
+        flow = object.__new__(bloop.BloopFlow)
+        flow._model_dl_lock = threading.Lock()
+        flow._model_dl_requested = None
+        flow._model_dl_thread = None
+        flow._model_dl_state = "idle"
+        flow._model_dl_target = None
+        flow._model_dl_error = None
+        flow._model_dl_progress = None
+        flow._model_dl_milestone = -1
+        flow._model_ready = False
+        flow._runtime_model = "mlx-community/whisper-tiny-mlx"
+        flow._bundled_model_path = lambda _t: None
+        flow._model_is_available = lambda _t: True
+        flow._publish_runtime_status = lambda extra=None: None
+        flow._print = lambda *_a: None
+        return flow
+
+    def _wait_download_worker_retired(self, flow, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with flow._model_dl_lock:
+                if flow._model_dl_thread is None:
+                    return True
+            time.sleep(0.02)
+        return False
+
+    def test_model_download_loop_releases_worker_slot_atomically(self):
+        # Exit protocol: the no-more-work check and the worker-slot release
+        # share ONE lock acquisition. A split check/release let a re-queue
+        # land between them, see is_alive() True, and return — the request
+        # was never consumed and the state sat in "queued" forever.
+        flow = self._make_download_flow()
+        flow._queue_model_download(flow._runtime_model)
+        self.assertTrue(self._wait_download_worker_retired(flow))
+        self.assertTrue(flow._model_ready)
+        self.assertEqual(flow._model_dl_state, "idle")
+        # A retry after the worker retired starts a fresh worker — it must
+        # not be swallowed by a stale thread handle.
+        flow._model_ready = False
+        flow._queue_model_download(flow._runtime_model)
+        self.assertTrue(self._wait_download_worker_retired(flow))
+        self.assertTrue(flow._model_ready)
+        # Source-level guard: the release lives inside the same locked block
+        # as the emptiness check, before any download work.
+        src = inspect.getsource(self.bloop.BloopFlow._model_download_loop)
+        self.assertLess(
+            src.index("if not target:"),
+            src.index("self._model_dl_thread = None"),
+        )
+        self.assertLess(
+            src.index("self._model_dl_thread = None"),
+            src.index("boot_fill"),
+        )
+
+    def test_start_recording_requeues_stranded_queued_download(self):
+        # Belt and suspenders: "queued" with no live worker thread can never
+        # progress on its own — the hotkey refusal must re-queue it like a
+        # failure instead of printing "one moment…" forever.
+        bloop = self.bloop
+        flow = object.__new__(bloop.BloopFlow)
+        flow._model_dl_lock = threading.Lock()
+        flow._model_dl_state = "queued"
+        flow._model_dl_thread = None
+        flow._model_dl_progress = None
+        flow._runtime_model = "mlx-community/whisper-tiny-mlx"
+        printed = []
+        flow._print = printed.append
+        requeued = []
+        flow._queue_model_download = requeued.append
+        flow._refuse_recording_model_not_ready()
+        self.assertEqual(requeued, ["mlx-community/whisper-tiny-mlx"])
+
+    def test_retry_command_targets_the_failed_download(self):
+        # Wizard Retry after a failed model SWITCH must re-queue the model
+        # that failed, not the runtime model (which would "succeed" without
+        # fixing anything).
+        bloop = self.bloop
+        flow = object.__new__(bloop.BloopFlow)
+        flow._model_dl_lock = threading.Lock()
+        flow._model_dl_state = "failed"
+        flow._model_dl_target = "mlx-community/whisper-large-v3-mlx"
+        flow._runtime_model = "mlx-community/whisper-tiny-mlx"
+        requeued = []
+        flow._queue_model_download = requeued.append
+        flow._handle_ui_command("retry_model_download")
+        self.assertEqual(requeued, ["mlx-community/whisper-large-v3-mlx"])
+        # No failure on record -> fall back to the runtime model.
+        flow._model_dl_state = "idle"
+        requeued.clear()
+        flow._handle_ui_command("retry_model_download")
+        self.assertEqual(requeued, ["mlx-community/whisper-tiny-mlx"])
+
+    def test_death_marker_outlives_background_status_publishers(self):
+        # _quit/_relaunch_self write {"pid": None, "stopped": True} as the
+        # crash-forensics death marker; download/progress threads that
+        # outlive it must not resurrect the file with a live pid.
+        bloop = self.bloop
+        for fn in (bloop.BloopFlow._quit, bloop.BloopFlow._relaunch_self):
+            src = inspect.getsource(fn)
+            self.assertLess(
+                src.index("self._status_publish_stopped = True"),
+                src.index('_runtime_status_update({"pid": None, "stopped": True})'),
+            )
+        src = inspect.getsource(bloop.BloopFlow._publish_runtime_status)
+        self.assertIn("if self._status_publish_stopped:", src)
+        src = inspect.getsource(bloop.BloopFlow._on_model_dl_progress)
+        self.assertIn("if self._status_publish_stopped:", src)
+        # Behavioral: once stopped, publish is a no-op.
+        flow = object.__new__(bloop.BloopFlow)
+        flow._status_publish_stopped = True
+        writes = []
+        orig = bloop._runtime_status_update
+        bloop._runtime_status_update = writes.append
+        try:
+            flow._publish_runtime_status()
+        finally:
+            bloop._runtime_status_update = orig
+        self.assertEqual(writes, [])
+
+    def test_mic_probe_serializes_against_portaudio_reset(self):
+        # _reset_portaudio takes _stream_close_lock before sd._terminate();
+        # the probe stream's open/use/close must hold the same lock or
+        # PortAudio can be torn down under a live stream (native crash).
+        src = inspect.getsource(self.bloop.BloopFlow._probe_microphone_input)
+        self.assertIn("with self._stream_close_lock:", src)
+        lock_idx = src.index("with self._stream_close_lock:")
+        self.assertLess(lock_idx, src.index("sd.InputStream("))
+        self.assertLess(src.index("probe.close()"), src.index("if not captured:"))
+        src = inspect.getsource(self.bloop.BloopFlow._reset_portaudio)
+        self.assertIn("self._stream_close_lock.acquire", src)
+
+    def test_onboarding_status_watch_survives_finish_then_restart(self):
+        # finish + restart landing in one command batch: the old watcher is
+        # still inside its final wait when the restart arrives. The restart
+        # must retire it and start a replacement — returning early left NO
+        # watcher running (wizard steps then never auto-advanced).
+        bloop = self.bloop
+        flow = object.__new__(bloop.BloopFlow)
+        flow._onboarding_stop = threading.Event()
+        flow._onboarding_thread = None
+        flow._onboarding_active = True
+        flow._viz = None
+        flow._hotkey_ready = True
+        flow._ax_status = "denied"
+        flow._refresh_permission_status = lambda publish=False: False
+        flow._publish_runtime_status = lambda extra=None: None
+
+        flow._start_onboarding_status_watch()
+        old = flow._onboarding_thread
+        self.assertTrue(old.is_alive())
+        flow._onboarding_stop.set()  # finish_onboarding
+        flow._start_onboarding_status_watch()  # restart in the same batch
+        try:
+            self.assertIsNot(flow._onboarding_thread, old)
+            self.assertTrue(flow._onboarding_thread.is_alive())
+            self.assertFalse(flow._onboarding_stop.is_set())
+            self.assertFalse(old.is_alive())
+        finally:
+            flow._onboarding_stop.set()
+            flow._onboarding_thread.join(timeout=2.0)
 
 
 if __name__ == "__main__":

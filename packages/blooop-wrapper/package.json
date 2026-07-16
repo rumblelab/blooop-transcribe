@@ -1,6 +1,6 @@
 {
   "name": "blooop",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Blooop CLI wrapper for macOS Apple Silicon runtime",
   "license": "MIT",
   "type": "commonjs",

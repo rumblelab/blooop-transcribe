@@ -37,6 +37,8 @@ DB_PATH    = os.path.join(STATE_DIR, "history.db")
 SETTINGS_PATH = os.path.join(STATE_DIR, "settings.json")
 RUNTIME_STATUS_PATH = os.path.join(STATE_DIR, "runtime_status.json")
 COMMAND_PATH = os.path.join(STATE_DIR, "history_command.json")
+# Webview -> main command channel (onboarding wizard buttons).
+UI_COMMAND_PATH = os.path.join(STATE_DIR, "ui_command.json")
 SETTINGS_FALLBACK = os.path.join(
     APP_BASE_DIR,
     ".bloop_flow",
@@ -48,6 +50,23 @@ _NOISE     = {"no_audio", "too_short"}
 _PARENT_PID = os.environ.get("BLOOOP_PARENT_PID")
 _SETTINGS_LOCK = threading.Lock()
 _SETTINGS_ACTIVE_PATH = None
+_UI_COMMAND_LOCK = threading.Lock()
+# ui_command.json keeps this many recent {seq, command} entries so clicks
+# faster than the main process's 0.5s poll aren't dropped.
+_UI_COMMAND_PENDING_MAX = 16
+
+# Must stay in sync with ONBOARDING_COMMANDS in bloop.py; the main process
+# validates again, this just refuses obvious garbage before it hits disk.
+_UI_COMMANDS = frozenset({
+    "request_mic",
+    "request_ax",
+    "open_privacy_mic",
+    "open_privacy_ax",
+    "retry_model_download",
+    "finish_onboarding",
+    "restart_onboarding",
+    "relaunch_app",
+})
 
 _SETTINGS_DEFAULTS = {
     "model": "mlx-community/whisper-small-mlx",
@@ -356,10 +375,68 @@ def _command_state_load():
             return {
                 "raise_seq": int(raw.get("raise_seq") or 0),
                 "settings_seq": int(raw.get("settings_seq") or 0),
+                "onboarding_seq": int(raw.get("onboarding_seq") or 0),
             }
     except Exception:
         pass
-    return {"raise_seq": 0, "settings_seq": 0}
+    return {"raise_seq": 0, "settings_seq": 0, "onboarding_seq": 0}
+
+
+def _ui_command_send(name):
+    """Write {"seq": n, "command": name, "pending": [...]} for the main
+    process to pick up.
+
+    "pending" is a short queue of recent {seq, command} entries, not a single
+    slot: the main process polls at 0.5s, and two buttons clicked within one
+    poll window must both go through (a single slot silently dropped the
+    first click). The seq continues from whatever is on disk so the main
+    process (which dedupes by seq) sees every write as new, even across
+    helper restarts. Returns the written seq, or 0 when the command isn't
+    allowlisted.
+    """
+    name = str(name or "").strip()
+    if name not in _UI_COMMANDS:
+        return 0
+    with _UI_COMMAND_LOCK:
+        seq = 0
+        pending = []
+        try:
+            with open(UI_COMMAND_PATH, "r", encoding="utf-8") as fh:
+                raw = json.load(fh)
+            if isinstance(raw, dict):
+                seq = int(raw.get("seq") or 0)
+                prev = raw.get("pending")
+                if isinstance(prev, list):
+                    pending = [
+                        {
+                            "seq": int(item.get("seq") or 0),
+                            "command": str(item.get("command") or ""),
+                        }
+                        for item in prev
+                        if isinstance(item, dict)
+                    ]
+                elif raw.get("command"):
+                    pending = [{"seq": seq, "command": str(raw.get("command"))}]
+        except Exception:
+            pass
+        seq += 1
+        pending.append({"seq": seq, "command": name})
+        pending = pending[-_UI_COMMAND_PENDING_MAX:]
+        os.makedirs(os.path.dirname(UI_COMMAND_PATH), exist_ok=True)
+        tmp = f"{UI_COMMAND_PATH}.tmp.{os.getpid()}"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"seq": seq, "command": name, "pending": pending}, fh)
+            os.replace(tmp, UI_COMMAND_PATH)
+        except Exception:
+            return 0
+        finally:
+            try:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+            except Exception:
+                pass
+        return seq
 
 
 def _settings_save(new_values):
@@ -401,6 +478,10 @@ class API:
     def get_command_state(self):
         return json.dumps(_command_state_load())
 
+    def send_command(self, name):
+        """Webview -> main command channel (onboarding wizard buttons)."""
+        return json.dumps({"seq": _ui_command_send(name)})
+
     def activate_window(self):
         """Bring this helper app to the front of macOS apps."""
         if sys.platform != "darwin":
@@ -439,7 +520,7 @@ HTML = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Bloop History</title>
+<title>Blooop</title>
 <style>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -458,6 +539,8 @@ HTML = """<!DOCTYPE html>
   --yellow:    #c9b79b;
   --red:       #ff7e6b;
   --gray:      #5d7488;
+  --coral:     #d97757;
+  --violet:    #8b7bd8;
 }
 
 html { height: 100%; }
@@ -678,6 +761,211 @@ body {
   from { transform: rotate(0deg); }
   to { transform: rotate(360deg); }
 }
+.runtime-progress {
+  margin-top: 6px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--border-2);
+  overflow: hidden;
+  display: none;
+}
+.runtime-progress.is-active { display: block; }
+.runtime-progress-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: 2px;
+  background: linear-gradient(90deg, var(--blue), var(--green));
+  transition: width 0.4s ease;
+}
+.runtime-progress.is-indeterminate .runtime-progress-fill {
+  width: 30%;
+  animation: runtime-progress-slide 1.4s ease-in-out infinite;
+}
+@keyframes runtime-progress-slide {
+  from { margin-left: -30%; }
+  to { margin-left: 100%; }
+}
+.settings-rerun {
+  margin-top: 10px;
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  font-size: 11px;
+  color: var(--fg-faint);
+  cursor: pointer;
+}
+.settings-rerun:hover { color: var(--blue); text-decoration: underline; }
+
+/* Boot: hide the normal UI until the first onboarding poll decides wizard
+   vs. app, so fresh installs never flash the history view for the ~1s the
+   js bridge takes to come up. The wizard overlay is deliberately excluded;
+   a bounded failsafe in JS reveals the UI even if status never loads. */
+body.is-booting > .header,
+body.is-booting > .settings,
+body.is-booting > .cards { visibility: hidden; }
+
+/* ── onboarding wizard ── */
+.onboarding {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  padding: 28px 20px;
+  overflow-y: auto;
+  background:
+    radial-gradient(120% 90% at 85% -10%, rgba(139,123,216,0.16), transparent 60%),
+    radial-gradient(100% 80% at 10% 110%, rgba(111,216,255,0.10), transparent 55%),
+    var(--bg);
+}
+.onboarding.is-visible { display: flex; }
+.ob-card {
+  width: 100%;
+  max-width: 340px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 26px 24px 22px;
+  box-shadow: 0 18px 50px rgba(0,0,0,0.45);
+}
+.ob-dots {
+  display: flex;
+  gap: 7px;
+  justify-content: center;
+  margin-bottom: 20px;
+}
+.ob-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--border-2);
+  transition: background 0.2s, transform 0.2s;
+}
+.ob-dot.is-on { background: var(--coral); transform: scale(1.25); }
+.ob-dot.is-done { background: var(--violet); }
+.ob-step { display: none; }
+.ob-step.is-current { display: block; animation: ob-fade 0.25s ease; }
+@keyframes ob-fade {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+.ob-kicker {
+  font-size: 11px;
+  letter-spacing: 1.4px;
+  text-transform: uppercase;
+  color: var(--violet);
+  margin-bottom: 8px;
+}
+.ob-title {
+  font-size: 19px;
+  font-weight: 700;
+  letter-spacing: -0.3px;
+  margin-bottom: 8px;
+}
+.ob-copy {
+  font-size: 13px;
+  color: var(--fg-muted);
+  line-height: 1.6;
+  margin-bottom: 18px;
+}
+.ob-state {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--fg-muted);
+  min-height: 18px;
+  margin-bottom: 14px;
+}
+.ob-state.is-ok { color: var(--green); }
+.ob-state.is-bad { color: var(--red); }
+.ob-actions { display: flex; flex-direction: column; gap: 8px; }
+.ob-btn {
+  width: 100%;
+  padding: 9px 14px;
+  border-radius: 9px;
+  border: 1px solid transparent;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  background: var(--coral);
+  color: #14100d;
+  transition: filter 0.12s, border-color 0.12s;
+}
+.ob-btn:hover { filter: brightness(1.08); }
+.ob-btn.ghost {
+  background: var(--surface-2);
+  color: var(--fg);
+  border-color: var(--border-2);
+  font-weight: 500;
+}
+.ob-btn.ghost:hover { border-color: var(--violet); filter: none; }
+.ob-link {
+  display: block;
+  width: 100%;
+  margin-top: 12px;
+  background: none;
+  border: none;
+  font: inherit;
+  font-size: 11px;
+  color: var(--fg-faint);
+  cursor: pointer;
+  text-align: center;
+}
+.ob-link:hover { color: var(--fg-muted); text-decoration: underline; }
+.ob-hint {
+  font-size: 11px;
+  color: var(--fg-faint);
+  line-height: 1.5;
+  margin-top: 12px;
+}
+.ob-progress-note {
+  font-size: 11px;
+  color: var(--fg-faint);
+  margin: 6px 0 14px;
+  min-height: 14px;
+}
+.onboarding .runtime-progress { margin-top: 0; }
+.ob-try-card {
+  display: none;
+  background: var(--surface-2);
+  border: 1px solid #1d6a55;
+  border-radius: 10px;
+  padding: 12px;
+  margin-bottom: 14px;
+  font-size: 13px;
+  color: var(--fg);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.ob-try-card.is-visible { display: block; }
+.ob-state { flex-wrap: wrap; }
+.ob-state-link {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  font-size: 12px;
+  color: var(--blue);
+  cursor: pointer;
+  text-decoration: underline;
+}
+.ob-state-link:hover { color: var(--fg); }
+#ob-try-input {
+  width: 100%;
+  border: 1px solid var(--border-2);
+  border-radius: 9px;
+  padding: 9px 10px;
+  background: var(--surface-2);
+  color: var(--fg);
+  font: inherit;
+  font-size: 13px;
+  margin-bottom: 14px;
+}
+#ob-try-input::placeholder { color: var(--fg-faint); }
 
 /* ── card list ── */
 .cards {
@@ -842,11 +1130,11 @@ body {
 }
 </style>
 </head>
-<body>
+<body class="is-booting">
 
 <div class="header">
   <div class="header-left">
-    <span class="header-title">Bloop History</span>
+    <span class="header-title">Blooop</span>
     <span class="header-count" id="count"></span>
   </div>
   <div class="header-right">
@@ -863,30 +1151,30 @@ body {
   </div>
   <div class="settings-grid">
     <div class="field full">
-      <label for="s-model">Model</label>
+      <label for="s-model">Speech model</label>
       <select id="s-model">
-        <option value="mlx-community/whisper-tiny-mlx">Tiny - fastest, lowest accuracy</option>
-        <option value="mlx-community/whisper-small-mlx">Small - fast, good accuracy</option>
-        <option value="mlx-community/whisper-medium-mlx">Medium - slower, better accuracy</option>
-        <option value="mlx-community/whisper-large-v3-mlx">Large v3 - slowest, best accuracy</option>
+        <option value="mlx-community/whisper-tiny-mlx">Tiny &mdash; fastest, lowest accuracy (~80 MB)</option>
+        <option value="mlx-community/whisper-small-mlx">Small &mdash; fast, good accuracy (~460 MB)</option>
+        <option value="mlx-community/whisper-medium-mlx">Medium &mdash; slower, better accuracy (~1.5 GB)</option>
+        <option value="mlx-community/whisper-large-v3-mlx">Large v3 &mdash; slowest, best accuracy (~3 GB)</option>
       </select>
     </div>
 
     <div class="field">
       <label for="s-hotkey">Push-to-talk key</label>
       <select id="s-hotkey">
-        <option value="right_cmd">Right Cmd</option>
-        <option value="right_option">Right Option</option>
-        <option value="right_shift">Right Shift</option>
+        <option value="right_cmd">Right Command (&#8984;)</option>
+        <option value="right_option">Right Option (&#8997;)</option>
+        <option value="right_shift">Right Shift (&#8679;)</option>
       </select>
     </div>
 
     <div class="field">
-      <label for="s-silence">Silence trim</label>
+      <label for="s-silence">Trim pauses</label>
       <select id="s-silence">
-        <option value="off">Off</option>
-        <option value="normal">Normal</option>
-        <option value="aggressive">Aggressive</option>
+        <option value="off">Off &mdash; keep everything</option>
+        <option value="normal">Normal &mdash; recommended</option>
+        <option value="aggressive">Aggressive &mdash; cuts long pauses</option>
       </select>
     </div>
 
@@ -908,31 +1196,31 @@ body {
     </div>
 
     <div class="field">
-      <label>Chunking (latch mode)</label>
+      <label>Hands-free mode (double-tap the hotkey)</label>
       <div class="check-row">
         <input type="checkbox" id="s-latch-mode">
-        <span>Enable chunking</span>
+        <span>Paste text every few seconds while recording</span>
       </div>
     </div>
 
     <div class="field full">
-      <label for="s-chunk-sec">Chunk seconds</label>
+      <label for="s-chunk-sec">Seconds between pastes</label>
       <input id="s-chunk-sec" type="number" min="2" max="60" step="1" value="10">
     </div>
 
     <div class="field">
-      <label>Recording pill</label>
+      <label>Recording indicator</label>
       <div class="check-row">
         <input type="checkbox" id="s-pill">
-        <span>Show pill (relaunch to apply)</span>
+        <span>Show a floating indicator while recording (takes effect after relaunch)</span>
       </div>
     </div>
 
     <div class="field">
-      <label for="s-pillstyle">Pill style (relaunch to apply)</label>
+      <label for="s-pillstyle">Indicator style (takes effect after relaunch)</label>
       <select id="s-pillstyle">
-        <option value="bubbles">Bubbles &mdash; the namesake</option>
-        <option value="spectrogram">Spectrogram &mdash; NOAA trace</option>
+        <option value="bubbles">Bubbles &mdash; floating dots (the namesake)</option>
+        <option value="spectrogram">Spectrogram &mdash; scrolling sound waves</option>
       </select>
     </div>
 
@@ -946,9 +1234,88 @@ body {
     <span class="runtime-spinner" id="runtime-spinner"></span>
     <span id="settings-runtime"></span>
   </div>
+  <div class="runtime-progress" id="runtime-progress">
+    <div class="runtime-progress-fill" id="runtime-progress-fill"></div>
+  </div>
+  <button class="settings-rerun" id="run-setup-again" title="Show the first-run setup wizard again">Run setup again</button>
 </div>
 
 <div class="cards" id="cards"></div>
+
+<div class="onboarding" id="onboarding">
+  <div class="ob-card">
+    <div class="ob-dots" id="ob-dots"></div>
+
+    <div class="ob-step is-current" id="ob-step-welcome">
+      <div class="ob-kicker">Welcome to</div>
+      <div class="ob-title">Blooop</div>
+      <div class="ob-copy">Hold the right-hand &#8984; Command key, speak, then let go &mdash; your words appear wherever your cursor is. Setup takes about a minute: two macOS permissions and a one-time model download.</div>
+      <div class="ob-actions">
+        <button class="ob-btn" onclick="obSetStep('mic')">Get Started</button>
+      </div>
+    </div>
+
+    <div class="ob-step" id="ob-step-mic">
+      <div class="ob-kicker">Step 1 of 4</div>
+      <div class="ob-title">Microphone</div>
+      <div class="ob-copy">Blooop listens only while you hold the hotkey. Audio never leaves your Mac &mdash; transcription is fully local.</div>
+      <div class="ob-state" id="ob-mic-state"></div>
+      <div class="ob-actions">
+        <button class="ob-btn" id="ob-mic-request" onclick="obSend('request_mic')">Allow microphone</button>
+        <button class="ob-btn ghost" id="ob-mic-settings" onclick="obSend('open_privacy_mic')" style="display:none">Open System Settings</button>
+      </div>
+      <div class="ob-hint">Blooop re-checks automatically after you grant.</div>
+      <button class="ob-link" onclick="obSetStep('ax')">Skip for now</button>
+    </div>
+
+    <div class="ob-step" id="ob-step-ax">
+      <div class="ob-kicker">Step 2 of 4</div>
+      <div class="ob-title">Accessibility</div>
+      <div class="ob-copy">macOS asks for its &ldquo;Accessibility&rdquo; permission before an app can respond to a key you press while you&rsquo;re in other apps &mdash; that&rsquo;s how Blooop hears the hotkey and pastes text for you. Blooop never reads your screen or watches what you type.</div>
+      <div class="ob-state" id="ob-ax-state"></div>
+      <div class="ob-actions">
+        <button class="ob-btn" id="ob-ax-request" onclick="obSend('request_ax')">Enable Accessibility</button>
+        <button class="ob-btn ghost" id="ob-ax-settings" onclick="obSend('open_privacy_ax')" style="display:none">Open System Settings</button>
+        <button class="ob-btn" id="ob-ax-continue" onclick="obSetStep('model')" style="display:none">Continue</button>
+        <button class="ob-btn ghost" id="ob-ax-relaunch" onclick="obSend('relaunch_app')" style="display:none">Relaunch Blooop</button>
+      </div>
+      <div class="ob-hint" id="ob-ax-hint">Blooop re-checks automatically after you grant.</div>
+      <button class="ob-link" onclick="obSetStep('model')">Skip for now</button>
+    </div>
+
+    <div class="ob-step" id="ob-step-model">
+      <div class="ob-kicker">Step 3 of 4</div>
+      <div class="ob-title">Speech model</div>
+      <div class="ob-copy">Blooop needs a speech-recognition model that runs entirely on your Mac &mdash; about 460 MB, downloaded once. After this, everything works offline and nothing you say ever leaves your computer.</div>
+      <div class="ob-state" id="ob-model-state"></div>
+      <div class="runtime-progress" id="ob-model-progress">
+        <div class="runtime-progress-fill" id="ob-model-progress-fill"></div>
+      </div>
+      <div class="ob-progress-note" id="ob-model-note"></div>
+      <div class="ob-actions">
+        <button class="ob-btn" id="ob-model-retry" onclick="obSend('retry_model_download')" style="display:none">Retry download</button>
+        <button class="ob-btn" id="ob-model-continue" onclick="obSetStep('try')" style="display:none">Continue</button>
+      </div>
+      <button class="ob-link" onclick="obSetStep('try')">Skip for now</button>
+    </div>
+
+    <div class="ob-step" id="ob-step-try">
+      <div class="ob-kicker">Step 4 of 4</div>
+      <div class="ob-title">Try it</div>
+      <div class="ob-copy" id="ob-try-copy">Click into the box below &mdash; or any app &mdash; hold right-&#8984;, and say something. Release, and your words paste right at your cursor.</div>
+      <input id="ob-try-input" placeholder="Click here, then hold right-&#8984; and speak" spellcheck="false">
+      <div class="ob-try-card" id="ob-try-success"><span id="ob-try-text"></span></div>
+      <div class="ob-state" id="ob-try-state">Listening for your first take&hellip;</div>
+      <div class="ob-actions">
+        <button class="ob-btn" id="ob-finish" onclick="obFinish()" style="display:none">Finish</button>
+      </div>
+      <div class="ob-hint" id="ob-try-stuck" style="display:none">Nothing happening when you hold the key?
+        <button class="ob-state-link" onclick="obSend('relaunch_app')">Relaunch Blooop</button> &mdash; macOS sometimes needs it after granting Accessibility.</div>
+      <div class="ob-hint">Blooop lives in your menu bar &mdash; look for the little waveform near the clock. You can close this window anytime and reopen it from there.</div>
+      <button class="ob-link" onclick="obFinish()">Skip and finish setup</button>
+    </div>
+  </div>
+</div>
 
 <script>
 const COLORS = {
@@ -982,7 +1349,7 @@ function setSettingsStatus(msg, isError=false) {
   if (live) live.style.color = isError ? 'var(--red)' : 'var(--fg-faint)';
 }
 
-function setRuntimeStatus(msg, isError=false, busy=false) {
+function setRuntimeStatus(msg, isError=false, busy=false, progress=null) {
   const wrap = document.getElementById('settings-runtime-wrap');
   const el = document.getElementById('settings-runtime');
   const spin = document.getElementById('runtime-spinner');
@@ -990,42 +1357,391 @@ function setRuntimeStatus(msg, isError=false, busy=false) {
   el.textContent = msg || '';
   wrap.classList.toggle('is-error', !!isError);
   spin.classList.toggle('is-active', !!busy);
+  const bar = document.getElementById('runtime-progress');
+  const fill = document.getElementById('runtime-progress-fill');
+  if (!bar || !fill) return;
+  // progress: null = hidden, -1 = indeterminate slide, 0..100 = percent fill.
+  const active = progress !== null && progress !== undefined;
+  bar.classList.toggle('is-active', active);
+  bar.classList.toggle('is-indeterminate', active && progress < 0);
+  fill.style.width = (active && progress >= 0)
+    ? `${Math.max(0, Math.min(100, progress))}%` : '';
+}
+
+const MODEL_NAMES = {
+  'mlx-community/whisper-tiny-mlx': 'Tiny',
+  'mlx-community/whisper-small-mlx': 'Small',
+  'mlx-community/whisper-medium-mlx': 'Medium',
+  'mlx-community/whisper-large-v3-mlx': 'Large v3',
+};
+
+function modelName(id) {
+  return MODEL_NAMES[id] || id;
 }
 
 function summarizeRuntimeStatus(s) {
-  if (!s || typeof s !== 'object') return { msg: '', isError: false, busy: false };
+  if (!s || typeof s !== 'object') return { msg: '', isError: false, busy: false, progress: null };
   const runtime = (s.runtime_model || '').trim();
   const requested = (s.requested_model || runtime).trim();
   const state = (s.model_download_state || 'idle').trim();
   const target = (s.model_download_target || requested || '').trim();
   const error = (s.model_download_error || '').trim();
+  // Boot fill: the runtime model itself is downloading — nothing is loaded,
+  // so "(using X)" and "relaunch to switch" wording would both be wrong.
+  const bootFill = target === runtime;
+  const usingNote = bootFill ? '' : ` (using ${modelName(runtime)})`;
 
-  if (!runtime) return { msg: '', isError: false, busy: false };
+  if (!runtime) return { msg: '', isError: false, busy: false, progress: null };
   if (state === 'downloading' && target) {
-    return { msg: `Downloading model: ${target} (using ${runtime})`, isError: false, busy: true };
+    const p = s.model_download_progress;
+    if (p && typeof p === 'object') {
+      const pct = (typeof p.percent === 'number') ? p.percent : -1;
+      const mb = `${p.downloaded_mb || 0}/${p.total_mb || 0} MB`;
+      if (pct >= 0) {
+        return { msg: `Downloading model: ${modelName(target)} — ${pct}% (${mb})${usingNote}`, isError: false, busy: true, progress: pct };
+      }
+      return { msg: `Downloading model: ${modelName(target)} — ${p.downloaded_mb || 0} MB so far${usingNote}`, isError: false, busy: true, progress: -1 };
+    }
+    return { msg: `Downloading model: ${modelName(target)}${usingNote}`, isError: false, busy: true, progress: -1 };
   }
   if (state === 'queued' && target) {
-    return { msg: `Queued model download: ${target} (using ${runtime})`, isError: false, busy: true };
+    return { msg: `Queued model download: ${modelName(target)}${usingNote}`, isError: false, busy: true, progress: -1 };
   }
   if (state === 'downloaded' && target) {
-    return { msg: `Model downloaded: ${target}. Relaunch Blooop to switch.`, isError: false, busy: false };
+    if (bootFill) {
+      return { msg: `Model downloaded: ${modelName(target)}. Warming up…`, isError: false, busy: true, progress: null };
+    }
+    return { msg: `Model downloaded: ${modelName(target)}. Relaunch Blooop to switch.`, isError: false, busy: false, progress: null };
   }
   if (state === 'failed') {
-    const detail = error || target || 'unknown error';
-    return { msg: `Model download failed: ${detail}`, isError: true, busy: false };
+    if (error) console.log('model download error:', error);
+    if (bootFill) {
+      return { msg: 'Model download failed — check your internet. Press the hotkey to retry.', isError: true, busy: false, progress: null };
+    }
+    return { msg: `Model download failed: ${modelName(target)} — check your internet, then choose the model again to retry.`, isError: true, busy: false, progress: null };
   }
   if (requested && requested !== runtime) {
-    return { msg: `Using ${runtime}. Next after relaunch: ${requested}`, isError: false, busy: false };
+    return { msg: `Using ${modelName(runtime)}. Next after relaunch: ${modelName(requested)}`, isError: false, busy: false, progress: null };
   }
-  return { msg: `Using model: ${runtime}`, isError: false, busy: false };
+  return { msg: `Using model: ${modelName(runtime)}`, isError: false, busy: false, progress: null };
 }
 
 async function refreshRuntimeStatus() {
   try {
     const raw = await window.pywebview.api.get_runtime_status();
     const info = summarizeRuntimeStatus(JSON.parse(raw || '{}'));
-    setRuntimeStatus(info.msg, info.isError, info.busy);
+    setRuntimeStatus(info.msg, info.isError, info.busy, info.progress);
   } catch (_) { /* bridge not ready yet */ }
+}
+
+/* ── onboarding wizard ── */
+const OB_STEPS = ['welcome', 'mic', 'ax', 'model', 'try'];
+const HOTKEY_GLYPHS = {
+  right_cmd: 'right-\\u2318',
+  right_option: 'right-\\u2325',
+  right_shift: 'right-\\u21e7',
+};
+let obStep = 'welcome';
+let obTryBaseline = null;      // {row id -> status} snapshot at try-step open
+let obTryBaselineLoading = false;
+let obTryEnteredAt = null;     // Date.now() when the try step opened
+let obAdvanceTimer = null;
+// Set when Finish/Skip is clicked: the backend needs up to a poll cycle to
+// flip onboarding_active off, and a stale active:true must not obShow(true)
+// the wizard back at the Welcome step. Cleared once the backend confirms
+// (active goes false) or a restart_onboarding seq bump arrives.
+let obFinishSent = false;
+
+function obSend(name) {
+  try { window.pywebview.api.send_command(name); } catch (_) {}
+}
+
+function obHotkeyGlyph() {
+  const sel = document.getElementById('s-hotkey');
+  return HOTKEY_GLYPHS[(sel && sel.value) || 'right_cmd'] || HOTKEY_GLYPHS.right_cmd;
+}
+
+function obSetStep(step) {
+  if (obStep === step) return;
+  obStep = step;
+  if (obAdvanceTimer) { clearTimeout(obAdvanceTimer); obAdvanceTimer = null; }
+  if (step === 'try') { obTryBaseline = null; obTryEnteredAt = Date.now(); obTryCaptureBaseline(); }
+  OB_STEPS.forEach((s) => {
+    const el = document.getElementById('ob-step-' + s);
+    if (el) el.classList.toggle('is-current', s === obStep);
+  });
+  // Dots track the four numbered steps only — the welcome card is uncounted
+  // ("Step N of 4" kickers), so it shows no dots at all.
+  const dots = document.getElementById('ob-dots');
+  if (dots) {
+    const steps = OB_STEPS.slice(1);
+    const idx = steps.indexOf(obStep);
+    dots.style.display = idx < 0 ? 'none' : '';
+    dots.innerHTML = idx < 0 ? '' : steps.map((s, i) =>
+      `<span class="ob-dot${i === idx ? ' is-on' : ''}${i < idx ? ' is-done' : ''}"></span>`
+    ).join('');
+  }
+}
+
+function obScheduleAdvance(next, delay) {
+  // Brief pause on the fresh checkmark before moving on, once per step.
+  if (obAdvanceTimer) return;
+  obAdvanceTimer = setTimeout(() => {
+    obAdvanceTimer = null;
+    obSetStep(next);
+  }, delay);
+}
+
+function obShow(show) {
+  const overlay = document.getElementById('onboarding');
+  if (!overlay) return;
+  const was = overlay.classList.contains('is-visible');
+  overlay.classList.toggle('is-visible', !!show);
+  if (show && !was) {
+    // Fresh run (boot or "Run setup again"): reset to the welcome step.
+    const success = document.getElementById('ob-try-success');
+    if (success) success.classList.remove('is-visible');
+    const tryState = document.getElementById('ob-try-state');
+    if (tryState) {
+      tryState.textContent = 'Listening for your first take\\u2026';
+      tryState.className = 'ob-state';
+    }
+    const finish = document.getElementById('ob-finish');
+    if (finish) finish.style.display = 'none';
+    const tryInput = document.getElementById('ob-try-input');
+    if (tryInput) tryInput.value = '';
+    const stuck = document.getElementById('ob-try-stuck');
+    if (stuck) stuck.style.display = 'none';
+    obStep = null;
+    obSetStep('welcome');
+  }
+  if (!show) {
+    obTryBaseline = null;
+    if (obAdvanceTimer) { clearTimeout(obAdvanceTimer); obAdvanceTimer = null; }
+  }
+}
+
+function obFinish() {
+  obFinishSent = true;
+  obSend('finish_onboarding');
+  obShow(false);
+}
+
+function updateOnboarding(s) {
+  const active = !!(s && s.onboarding_active);
+  if (!active) obFinishSent = false;
+  if (obFinishSent) { obShow(false); return; }
+  obShow(active);
+  if (!active) return;
+
+  const mic = s.mic_status || 'unknown';
+  const ax = s.ax_status || 'denied';
+  const hotkey = !!s.hotkey_ready;
+
+  // Microphone step
+  const micState = document.getElementById('ob-mic-state');
+  const micReq = document.getElementById('ob-mic-request');
+  const micSet = document.getElementById('ob-mic-settings');
+  if (mic === 'granted') {
+    micState.textContent = '\\u2713 Microphone granted';
+    micState.className = 'ob-state is-ok';
+    micReq.style.display = 'none';
+    micSet.style.display = 'none';
+    if (obStep === 'mic') obScheduleAdvance('ax', 900);
+  } else if (mic === 'denied') {
+    micState.textContent = '\\u2715 Denied \\u2014 turn on Blooop in System Settings \\u2192 Privacy & Security \\u2192 Microphone, then come back.';
+    micState.className = 'ob-state is-bad';
+    micReq.style.display = 'none';
+    micSet.style.display = '';
+  } else {
+    micState.textContent = 'Not granted yet';
+    micState.className = 'ob-state';
+    micReq.style.display = '';
+    micSet.style.display = 'none';
+  }
+
+  // Accessibility step
+  const axState = document.getElementById('ob-ax-state');
+  const axReq = document.getElementById('ob-ax-request');
+  const axSet = document.getElementById('ob-ax-settings');
+  const axCont = document.getElementById('ob-ax-continue');
+  const axRelaunch = document.getElementById('ob-ax-relaunch');
+  const axHint = document.getElementById('ob-ax-hint');
+  if (ax === 'granted') {
+    axState.textContent = '\\u2713 Accessibility granted';
+    axState.className = 'ob-state is-ok';
+    axReq.style.display = 'none';
+    axSet.style.display = 'none';
+    axCont.style.display = '';
+    axRelaunch.style.display = hotkey ? 'none' : '';
+    axHint.textContent = hotkey
+      ? 'All set \\u2014 hit Continue.'
+      : "If the hotkey doesn't respond in a few seconds, relaunch \\u2014 macOS sometimes requires it.";
+  } else {
+    axState.textContent = 'Not granted yet';
+    axState.className = 'ob-state';
+    axReq.style.display = '';
+    axSet.style.display = '';
+    axCont.style.display = 'none';
+    axRelaunch.style.display = 'none';
+    axHint.textContent = 'Blooop re-checks automatically after you grant.';
+  }
+
+  // Model step
+  const dlState = (s.model_download_state || 'idle');
+  const p = s.model_download_progress;
+  const mState = document.getElementById('ob-model-state');
+  const mBar = document.getElementById('ob-model-progress');
+  const mFill = document.getElementById('ob-model-progress-fill');
+  const mNote = document.getElementById('ob-model-note');
+  const mRetry = document.getElementById('ob-model-retry');
+  const mCont = document.getElementById('ob-model-continue');
+  const downloading = dlState === 'downloading' || dlState === 'queued';
+  const failed = dlState === 'failed';
+  // model_ready is the truth about the RUNTIME model; the download fields
+  // are global and may describe a model SWITCH (reachable via "Run setup
+  // again"). Ready wins: a stale switch-download state must neither show a
+  // phantom "warming up" nor block the wizard behind a failure the runtime
+  // model doesn't have.
+  const modelReady = s.model_ready !== false;
+
+  mRetry.style.display = (failed && !modelReady) ? '' : 'none';
+  mCont.style.display = modelReady ? '' : 'none';
+  mBar.classList.toggle('is-active', !modelReady && downloading);
+  if (modelReady) {
+    mState.textContent = '\\u2713 Model ready';
+    mState.className = 'ob-state is-ok';
+    mNote.textContent = '';
+  } else if (downloading) {
+    const pct = (p && typeof p.percent === 'number') ? p.percent : -1;
+    mBar.classList.toggle('is-indeterminate', pct < 0);
+    mFill.style.width = pct >= 0 ? `${Math.max(0, Math.min(100, pct))}%` : '';
+    mState.textContent = dlState === 'queued' ? 'Preparing download\\u2026' : 'Downloading\\u2026';
+    mState.className = 'ob-state';
+    mNote.textContent = !p ? ''
+      : (pct >= 0 ? `${pct}% \\u2014 ${p.downloaded_mb || 0}/${p.total_mb || 0} MB`
+                  : `${p.downloaded_mb || 0} MB so far`);
+  } else if (failed) {
+    mState.textContent = '\\u2715 Download failed \\u2014 check your internet';
+    mState.className = 'ob-state is-bad';
+    mNote.textContent = 'Check your connection, then click Retry. You can also finish setup now \\u2014 Blooop retries the download whenever you press the hotkey.';
+    if (s.model_download_error) console.log('model download error:', s.model_download_error);
+  } else if (dlState === 'downloaded') {
+    mState.textContent = '\\u2713 Downloaded \\u2014 warming up\\u2026';
+    mState.className = 'ob-state is-ok';
+    mNote.textContent = '';
+  } else {
+    mState.textContent = 'Preparing download\\u2026';
+    mState.className = 'ob-state';
+    mNote.textContent = '';
+  }
+  if (obStep === 'model' && modelReady) obScheduleAdvance('try', 900);
+
+  // Try-it step copy follows the configured hotkey.
+  const glyph = obHotkeyGlyph();
+  const tryCopy = document.getElementById('ob-try-copy');
+  if (tryCopy) {
+    tryCopy.textContent =
+      `Click into the box below \\u2014 or any app \\u2014 hold ${glyph}, and say something. Release, and your words paste right at your cursor.`;
+  }
+  const tryInput = document.getElementById('ob-try-input');
+  if (tryInput) {
+    tryInput.placeholder = `Click here, then hold ${glyph} and speak`;
+  }
+
+  // Try-it step diagnosis: a skipped/denied prerequisite means the hotkey
+  // will do nothing — say so and link back, instead of promising to listen.
+  if (obStep === 'try') {
+    const tryState = document.getElementById('ob-try-state');
+    const success = document.getElementById('ob-try-success');
+    const stuck = document.getElementById('ob-try-stuck');
+    const done = success && success.classList.contains('is-visible');
+    if (tryState && !done) {
+      const backLink = (label, step) =>
+        ` <button class="ob-state-link" onclick="obSetStep('${step}')">${label}</button>`;
+      if (mic !== 'granted') {
+        tryState.innerHTML = "\\u2715 Microphone isn't granted yet, so Blooop can't hear you."
+          + backLink('Go back to the Microphone step', 'mic');
+        tryState.className = 'ob-state is-bad';
+      } else if (ax !== 'granted' || !hotkey) {
+        tryState.innerHTML = "\\u2715 Accessibility isn't granted yet, so the hotkey can't be detected."
+          + backLink('Go back to the Accessibility step', 'ax');
+        tryState.className = 'ob-state is-bad';
+      } else if (!modelReady) {
+        tryState.innerHTML = 'Speech model still downloading \\u2014 this step unlocks when it finishes.'
+          + backLink('Back to download progress', 'model');
+        tryState.className = 'ob-state';
+      } else {
+        tryState.textContent = 'Listening for your first take\\u2026';
+        tryState.className = 'ob-state';
+      }
+      // Everything reads ready but no take has landed in ~12s: surface the
+      // relaunch escape hatch here, where the dead hotkey is discovered.
+      const ready = mic === 'granted' && ax === 'granted' && hotkey && modelReady;
+      const stalled = ready && obTryEnteredAt !== null
+        && (Date.now() - obTryEnteredAt) > 12000;
+      if (stuck) stuck.style.display = stalled ? '' : 'none';
+    } else if (stuck && done) {
+      stuck.style.display = 'none';
+    }
+  }
+}
+
+async function obTryCaptureBaseline() {
+  // {id -> status} at try-step open. Latch-mode rows are created at session
+  // START and updated in place to ok, so a created_at cutoff missed any take
+  // spanning the step open; instead, credit rows that either appear after
+  // the snapshot or flip to ok from a non-ok baseline status.
+  if (obTryBaselineLoading || obTryBaseline !== null) return;
+  obTryBaselineLoading = true;
+  try {
+    const raw = await window.pywebview.api.get_history();
+    const rows = JSON.parse(raw || '[]');
+    const base = {};
+    for (const r of rows) base[r.id] = r.status;
+    if (obStep === 'try') obTryBaseline = base;
+  } catch (_) { /* bridge not ready yet; retried from obCheckTryIt */ }
+  obTryBaselineLoading = false;
+}
+
+async function obCheckTryIt() {
+  if (obStep !== 'try') return;
+  if (obTryBaseline === null) { await obTryCaptureBaseline(); return; }
+  try {
+    const raw = await window.pywebview.api.get_history();
+    const rows = JSON.parse(raw || '[]');
+    for (const r of rows) {
+      if (r.status !== 'ok' || !(r.text || '').trim()) continue;
+      const before = obTryBaseline[r.id];
+      if (before === undefined || before !== 'ok') {
+        document.getElementById('ob-try-text').textContent = r.text.trim();
+        document.getElementById('ob-try-success').classList.add('is-visible');
+        const st = document.getElementById('ob-try-state');
+        st.textContent = "\\u2713 That's it \\u2014 you're set.";
+        st.className = 'ob-state is-ok';
+        document.getElementById('ob-finish').style.display = '';
+        break;
+      }
+    }
+  } catch (_) { /* bridge not ready yet */ }
+}
+
+function bootReveal() {
+  document.body.classList.remove('is-booting');
+}
+// Failsafe: the page must never stay permanently blank — reveal the normal
+// UI even if the runtime-status bridge never comes up.
+setTimeout(bootReveal, 2500);
+
+async function pollOnboarding() {
+  // Faster (1s) than the 2s data tick so wizard steps advance promptly.
+  try {
+    const raw = await window.pywebview.api.get_runtime_status();
+    updateOnboarding(JSON.parse(raw || '{}'));
+    // First wizard-or-app decision made: safe to reveal the UI.
+    bootReveal();
+  } catch (_) { /* bridge not ready yet */ }
+  await obCheckTryIt();
 }
 
 function setSettingsOpen(open) {
@@ -1241,7 +1957,7 @@ function renderAll(rows) {
     cards.innerHTML = `
       <div class="empty">
         <div class="empty-icon">🎙</div>
-        No transcriptions yet.
+        Nothing here yet. Click into any app, hold ${obHotkeyGlyph()}, and speak \\u2014 release to paste. Every take also lands here.
       </div>`;
     countEl.textContent = '';
     return;
@@ -1323,14 +2039,17 @@ async function refresh() {
 
 let lastRaiseSeq = null;
 let lastSettingsSeq = null;
+let lastOnboardingSeq = null;
 async function pollCommands() {
   try {
     const raw = await window.pywebview.api.get_command_state();
     const cmd = JSON.parse(raw || '{}');
     const r = Number(cmd.raise_seq || 0);
     const s = Number(cmd.settings_seq || 0);
+    const o = Number(cmd.onboarding_seq || 0);
     if (lastRaiseSeq === null) lastRaiseSeq = r;
     if (lastSettingsSeq === null) lastSettingsSeq = s;
+    if (lastOnboardingSeq === null) lastOnboardingSeq = o;
     if (r > lastRaiseSeq) {
       lastRaiseSeq = r;
       try { window.pywebview.api.activate_window(); } catch (_) {}
@@ -1339,6 +2058,15 @@ async function pollCommands() {
     if (s > lastSettingsSeq) {
       lastSettingsSeq = s;
       setSettingsOpen(true);
+    }
+    if (o > lastOnboardingSeq) {
+      lastOnboardingSeq = o;
+      // A restart bumps the seq: re-arm the wizard even if a Finish click's
+      // suppression flag is still pending (finish + restart can land inside
+      // one poll window, so active:false may never be observed).
+      obFinishSent = false;
+      try { window.pywebview.api.activate_window(); } catch (_) {}
+      pollOnboarding();
     }
   } catch (_) { /* bridge not ready yet */ }
 }
@@ -1361,6 +2089,14 @@ function initSettingsBindings() {
     el.addEventListener(evt, scheduleSettingsSave);
   });
 
+  const rerun = document.getElementById('run-setup-again');
+  if (rerun) {
+    rerun.addEventListener('click', () => {
+      obSend('restart_onboarding');
+      setSettingsOpen(false);
+    });
+  }
+
   document.addEventListener('keydown', (ev) => {
     if (ev.key === 'Escape') setSettingsOpen(false);
   });
@@ -1373,11 +2109,15 @@ window.addEventListener('pywebviewready', async () => {
   await loadSettings();
   await tick();
   await pollCommands();
+  await pollOnboarding();
 });
 setInterval(tick, 2000);
 // Commands (raise window / open settings from the menu bar) poll faster than
 // the data tick so menu clicks feel immediate instead of up-to-2s laggy.
 setInterval(pollCommands, 500);
+// The wizard polls runtime status at 1s so permission grants, download
+// progress, and the try-it success card advance the steps promptly.
+setInterval(pollOnboarding, 1000);
 </script>
 </body>
 </html>"""
@@ -1386,7 +2126,7 @@ setInterval(pollCommands, 500);
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def run_history_ui():
-    _set_process_program_name("Blooop History")
+    _set_process_program_name("Blooop")
     _force_macos_ui_element()
     _set_macos_accessory_app()
     threading.Thread(target=_watch_parent_and_exit, daemon=True).start()
@@ -1398,7 +2138,7 @@ def run_history_ui():
 
     api    = API()
     window = webview.create_window(
-        "Bloop History",
+        "Blooop",
         html=HTML,
         width=460,
         height=720,
@@ -1410,7 +2150,7 @@ def run_history_ui():
 
     def _on_start():
         # Some GUI backends can reset activation policy during startup.
-        _set_process_program_name("Blooop History")
+        _set_process_program_name("Blooop")
         _force_macos_ui_element()
         _set_macos_accessory_app()
 

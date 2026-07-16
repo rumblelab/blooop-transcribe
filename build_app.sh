@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build /Applications/Blooop.app via PyInstaller.
-# Usage: ./build_app.sh [--install] [--notarize] [--release]
+# Usage: ./build_app.sh [--install] [--notarize] [--release] [--bundle-models]
 #   --install   copy the result to /Applications after a successful build
 #   --notarize  submit the signed .app to Apple's notary service and staple
 #               the ticket. Requires a keychain profile saved beforehand via
@@ -12,6 +12,9 @@
 #   --release   convenience: implies --notarize and produces dist/Blooop.zip
 #               ready to hand to another Mac (Gatekeeper-approved via the
 #               stapled ticket, no first-launch right-click-open needed).
+#   --bundle-models  embed bundled-models/ into the .app (~500MB). Default
+#               builds ship model-free: the app downloads the Whisper model
+#               on demand at first launch instead.
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -35,13 +38,15 @@ fi
 INSTALL=0
 NOTARIZE=0
 RELEASE=0
+BUNDLE_MODELS=0
 for arg in "$@"; do
     case "$arg" in
         --install) INSTALL=1 ;;
         --notarize) NOTARIZE=1 ;;
         --release) NOTARIZE=1; RELEASE=1 ;;
+        --bundle-models) BUNDLE_MODELS=1 ;;
         --help|-h)
-            sed -n '2,15p' "$0"
+            sed -n '2,18p' "$0"
             exit 0
             ;;
         *)
@@ -74,12 +79,21 @@ if [ ! -f "$ICON_DST" ]; then
     fi
 fi
 
-# Stage bundled models from the installed bundle if we don't already have
-# a local copy. 459MB — kept out of git; copied from the old bundle so a
-# fresh build still boots offline.
-if [ ! -d "$DIR/bundled-models" ] && [ -d "$INSTALLED_APP/Contents/Resources/bundled-models" ]; then
-    echo "→ Copying bundled-models from $INSTALLED_APP (one-time; ~500MB)"
-    cp -R "$INSTALLED_APP/Contents/Resources/bundled-models" "$DIR/bundled-models"
+# Bundled models are opt-in (--bundle-models). Default builds are model-free
+# — the app downloads the Whisper model on demand at first launch — and the
+# spec only picks up a local bundled-models/ dir when BLOOOP_BUNDLE_MODELS=1,
+# so a stale local copy can't sneak ~500MB into a default build.
+if [ "$BUNDLE_MODELS" -eq 1 ]; then
+    export BLOOOP_BUNDLE_MODELS=1
+    # Stage bundled models from the installed bundle if we don't already have
+    # a local copy. 459MB — kept out of git; copied from the old bundle so a
+    # fresh build still boots offline.
+    if [ ! -d "$DIR/bundled-models" ] && [ -d "$INSTALLED_APP/Contents/Resources/bundled-models" ]; then
+        echo "→ Copying bundled-models from $INSTALLED_APP (one-time; ~500MB)"
+        cp -R "$INSTALLED_APP/Contents/Resources/bundled-models" "$DIR/bundled-models"
+    fi
+else
+    echo "→ Model-free build (models download on demand; pass --bundle-models to embed)"
 fi
 
 echo "→ Cleaning build/ and dist/"
@@ -175,7 +189,11 @@ if [ "$NOTARIZE" -eq 1 ]; then
     rm -f "$NOTARY_ZIP"
 
     if [ "$RELEASE" -eq 1 ]; then
-        RELEASE_ZIP="$DIR/dist/Blooop.zip"
+        # Versioned zip name: every release must be distinguishable from the
+        # last, both on disk and in users' Downloads folders.
+        VERSION="$(sed -n 's/.*"CFBundleShortVersionString": "\([^"]*\)".*/\1/p' "$DIR/Blooop.spec" | head -n 1)"
+        VERSION="${VERSION:-0.0.0}"
+        RELEASE_ZIP="$DIR/dist/Blooop-${VERSION}.zip"
         rm -f "$RELEASE_ZIP"
         /usr/bin/ditto -c -k --keepParent "$DIST_APP" "$RELEASE_ZIP"
         echo "→ Release archive: $RELEASE_ZIP"

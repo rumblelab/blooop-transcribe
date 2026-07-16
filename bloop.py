@@ -17,7 +17,6 @@ Config at the top of this file.
 import multiprocessing
 import os
 import re
-import shutil
 import json
 import sys
 
@@ -192,16 +191,6 @@ def _ensure_macos_tool_paths():
             merged.append(p)
     merged.extend(parts)
     os.environ["PATH"] = ":".join(merged)
-
-
-def _resolve_ffmpeg():
-    cand = shutil.which("ffmpeg")
-    if cand and os.path.isfile(cand) and os.access(cand, os.X_OK):
-        return cand
-    for p in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"):
-        if os.path.isfile(p) and os.access(p, os.X_OK):
-            return p
-    return None
 
 
 _ensure_macos_tool_paths()
@@ -571,12 +560,13 @@ def _macos_set_dock_badge(label):
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
+APP_VERSION = "1.0.0"
 RUNTIME_BUILD = "2026-07-09-pill-rebuild-and-echo-filter"
 
 # MLX Whisper model from HuggingFace (downloaded on first use, cached after).
-# Faster / smaller  →  mlx-community/whisper-tiny-mlx   (~39 MB)
-# Good balance      →  mlx-community/whisper-small-mlx  (~250 MB)  ← current
-# Higher accuracy   →  mlx-community/whisper-medium-mlx (~770 MB)
+# Faster / smaller  →  mlx-community/whisper-tiny-mlx   (~80 MB)
+# Good balance      →  mlx-community/whisper-small-mlx  (~460 MB)  ← current
+# Higher accuracy   →  mlx-community/whisper-medium-mlx (~1.5 GB)
 # Best quality      →  mlx-community/whisper-large-v3-mlx (~3 GB)
 MODEL = "mlx-community/whisper-small-mlx"
 
@@ -762,6 +752,22 @@ BUNDLED_MODELS_DIR = os.path.join(APP_BASE_DIR, "bundled-models")
 SETTINGS_PATH = os.path.join(STATE_DIR, "settings.json")
 SETTINGS_FALLBACK = os.path.join(APP_BASE_DIR, ".bloop_flow", "settings.json")
 RUNTIME_STATUS_PATH = os.path.join(STATE_DIR, "runtime_status.json")
+# First-run marker: absent = fresh install (the onboarding wizard runs).
+ONBOARDING_STATE_PATH = os.path.join(STATE_DIR, "onboarding_state.json")
+# Webview -> main command channel (onboarding wizard buttons). The webview
+# writes {"seq": n, "command": name}; the main process polls and dedupes by seq.
+UI_COMMAND_FILE = os.path.join(STATE_DIR, "ui_command.json")
+# Allowlist for ui_command.json; unknown command names are ignored.
+ONBOARDING_COMMANDS = frozenset({
+    "request_mic",
+    "request_ax",
+    "open_privacy_mic",
+    "open_privacy_ax",
+    "retry_model_download",
+    "finish_onboarding",
+    "restart_onboarding",
+    "relaunch_app",
+})
 ISSUES_LOG_PATH = os.path.join(STATE_DIR, "issues.log")
 ISSUES_DIR = os.path.join(STATE_DIR, "issues")
 INSTANCE_LOCK_PATH = os.path.join(STATE_DIR, "blooop.lock")
@@ -780,21 +786,35 @@ DEFAULT_CUSTOM_VOCAB = ["Blooop"]
 MAX_CUSTOM_VOCAB_ITEMS = 64
 MAX_CUSTOM_VOCAB_CHARS = 80
 
+# Friendly names matching the settings dropdown; raw repo ids are jargon in
+# user-facing dialogs. Unknown ids fall back to their short slug.
+MODEL_DISPLAY_NAMES = {
+    "mlx-community/whisper-tiny-mlx": "Tiny",
+    "mlx-community/whisper-small-mlx": "Small",
+    "mlx-community/whisper-medium-mlx": "Medium",
+    "mlx-community/whisper-large-v3-mlx": "Large v3",
+}
+
+
+def _model_display_name(model_id):
+    return MODEL_DISPLAY_NAMES.get(model_id, str(model_id).rsplit("/", 1)[-1])
+
+
 HOTKEY_OPTIONS = {
     "right_cmd": {
-        "label": "Right Cmd",
+        "label": "Right Command (⌘)",
         "pynput_key": keyboard.Key.cmd_r,
         "mac_key_code": 54,
         "mac_modifier": "command",
     },
     "right_option": {
-        "label": "Right Option",
+        "label": "Right Option (⌥)",
         "pynput_key": keyboard.Key.alt_r,
         "mac_key_code": 61,
         "mac_modifier": "option",
     },
     "right_shift": {
-        "label": "Right Shift",
+        "label": "Right Shift (⇧)",
         "pynput_key": keyboard.Key.shift_r,
         "mac_key_code": 60,
         "mac_modifier": "shift",
@@ -1350,6 +1370,120 @@ def _runtime_status_update(values):
                     os.unlink(tmp)
             except Exception:
                 pass
+
+
+def _onboarding_state_load():
+    try:
+        with open(ONBOARDING_STATE_PATH, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+        if isinstance(raw, dict):
+            return raw
+    except Exception:
+        pass
+    return {}
+
+
+def _onboarding_state_write(payload):
+    os.makedirs(os.path.dirname(ONBOARDING_STATE_PATH), exist_ok=True)
+    tmp = f"{ONBOARDING_STATE_PATH}.tmp.{os.getpid()}"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp, ONBOARDING_STATE_PATH)
+    except Exception:
+        pass
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except Exception:
+            pass
+    return payload
+
+
+def _onboarding_mark_done():
+    return _onboarding_state_write({
+        "onboarded": True,
+        "completed_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    })
+
+
+def _onboarding_mark_in_progress():
+    """Wizard started but not finished. The marker's mere existence matters:
+    the boot grandfather rule (mic + AX granted -> silently mark onboarded)
+    applies only when NO marker file exists, so a mid-wizard relaunch — the
+    expected path after granting Accessibility — resumes the wizard instead
+    of grandfathering past the model/try-it steps."""
+    prior = _onboarding_state_load()
+    return _onboarding_state_write({
+        "onboarded": False,
+        "in_progress": True,
+        "started_at": (
+            prior.get("started_at")
+            or datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        ),
+    })
+
+
+try:
+    from tqdm.std import tqdm as _TqdmStd
+except Exception:  # tqdm ships as an mlx-whisper dependency
+    _TqdmStd = None
+
+if _TqdmStd is not None:
+    class _ModelDownloadTqdm(_TqdmStd):
+        """tqdm_class for snapshot_download that feeds a progress callback.
+
+        huggingface_hub 1.4.1 instantiates the caller's tqdm_class exactly
+        twice per snapshot_download: an aggregate bytes bar (unit="B", total
+        grows as file metadata arrives, updated from every worker thread via
+        the internal _AggregatedTqdm shim) and a thread_map files-count bar.
+        The bytes bar therefore already aggregates across files — we only
+        mirror its n/total out through the session callback and ignore the
+        files bar. Instances render nothing (disable=True); with tqdm
+        disabled update() doesn't track n, so we account it ourselves.
+        """
+
+        _cb_lock = threading.Lock()
+        _callback = None
+
+        @classmethod
+        def begin_session(cls, callback):
+            with cls._cb_lock:
+                cls._callback = callback
+
+        @classmethod
+        def end_session(cls):
+            with cls._cb_lock:
+                cls._callback = None
+
+        def __init__(self, *args, **kwargs):
+            # hf passes name="huggingface_hub.snapshot_download" for the
+            # bytes bar; tqdm.std doesn't accept it.
+            kwargs.pop("name", None)
+            self._bloop_bytes_bar = kwargs.get("unit") == "B"
+            kwargs["disable"] = True
+            super().__init__(*args, **kwargs)
+
+        def _bloop_report(self):
+            with self._cb_lock:
+                cb = type(self)._callback
+                n, total = self.n, self.total
+            if cb is not None and self._bloop_bytes_bar:
+                cb(n or 0, total or 0)
+
+        def update(self, n=1):
+            with self._cb_lock:
+                if n:
+                    self.n += n
+            self._bloop_report()
+
+        def close(self):
+            self._bloop_report()
+            super().close()
+else:  # pragma: no cover - only hit when tqdm is absent from the env
+    _ModelDownloadTqdm = None
 
 
 def _apply_silence_preset(name):
@@ -3109,6 +3243,7 @@ class WebviewHistoryPanel:
         self._settings_visible = False
         self._raise_seq = 0
         self._settings_seq = 0
+        self._onboarding_seq = 0
 
     def _proc_alive(self):
         return self._proc is not None and self._proc.poll() is None
@@ -3119,6 +3254,7 @@ class WebviewHistoryPanel:
             payload = {
                 "raise_seq": self._raise_seq,
                 "settings_seq": self._settings_seq,
+                "onboarding_seq": self._onboarding_seq,
             }
             tmp = f"{HISTORY_COMMAND_FILE}.tmp.{os.getpid()}"
             with open(tmp, "w", encoding="utf-8") as fh:
@@ -3161,6 +3297,15 @@ class WebviewHistoryPanel:
         with self._lock:
             self._spawn()
             self._raise_seq += 1
+            self._write_command()
+
+    def show_onboarding(self):
+        # onboarding_seq bumps open the wizard view in the webview; the raise
+        # bump fronts the window so a fresh install lands straight in setup.
+        with self._lock:
+            self._spawn()
+            self._raise_seq += 1
+            self._onboarding_seq += 1
             self._write_command()
 
     def refresh_if_visible(self):
@@ -4431,7 +4576,25 @@ def _install_menu_bar_icon(callbacks):
     else:
         button.setTitle_("B")
 
+    hotkey_label = callbacks.get("hotkey_label") or "the hotkey"
+    try:
+        button.setToolTip_(f"Blooop — hold {hotkey_label} and speak")
+    except Exception:
+        pass
+
     menu = NSMenu.alloc().init()
+    # Always-visible hotkey reminder: nothing else in the product restates
+    # the gesture once the setup wizard is gone. Disabled (no action) — the
+    # menu's autoenablesItems greys it out as a label.
+    try:
+        hint = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            f"Hold {hotkey_label} to dictate", None, ""
+        )
+        hint.setEnabled_(False)
+        menu.addItem_(hint)
+        menu.addItem_(NSMenuItem.separatorItem())
+    except Exception:
+        pass
     entries = [
         ("Show History", "showHistory:"),
         ("Show Settings…", "showSettings:"),
@@ -4470,6 +4633,11 @@ class BloopFlow:
         self._teardown_idle.set()
         self._audio_wedged = False
         self._quitting = False
+        # Set just before the death marker ({"pid": None, "stopped": True})
+        # is written in _quit/_relaunch_self: background download/progress
+        # threads outlive that write and must not resurrect the status file
+        # with a live pid (it is the crash-forensics surface).
+        self._status_publish_stopped = False
         self._stop_pending = False
         self._stop_grace_timer = None
         self._stop_finalize_lock = threading.Lock()
@@ -4492,6 +4660,13 @@ class BloopFlow:
         self._model_dl_state = "idle"
         self._model_dl_target = None
         self._model_dl_error = None
+        # Progress of the in-flight model download, replaced wholesale (never
+        # mutated) under _model_dl_lock so readers can snapshot without it.
+        self._model_dl_progress = None
+        self._model_dl_milestone = -1
+        # False only while the runtime model isn't on disk yet (fresh install
+        # boot); recording is refused until the boot download finishes.
+        self._model_ready = True
         self._kb          = KBController()
         self._hotkey_monitor = None
         self._menu_bar = None
@@ -4501,6 +4676,17 @@ class BloopFlow:
         self._settings_mtime = None
         self._settings_thread = None
         self._settings_stop = threading.Event()
+        # First-run onboarding: while active, mic/AX are re-probed ~1s and the
+        # webview wizard drives permission prompts via ui_command.json.
+        self._onboarding_active = False
+        self._onboarding_stop = threading.Event()
+        self._onboarding_thread = None
+        self._ui_cmd_stop = threading.Event()
+        self._ui_cmd_thread = None
+        self._ui_cmd_seq = 0
+        self._mic_status = "unknown"
+        self._ax_status = "denied"
+        self._hotkey_ready = False
         self._hotkey_name = DEFAULT_HOTKEY
         self._ptt_key = HOTKEY_OPTIONS[DEFAULT_HOTKEY]["pynput_key"]
         self._mic_silent_warned = False
@@ -4592,7 +4778,38 @@ class BloopFlow:
         bundled = self._bundled_model_path(model_name)
         return bundled if bundled else model_name
 
+    def _model_is_available(self, model_name):
+        """True when transcribing model_name needs no network (bundled or cached)."""
+        if self._bundled_model_path(model_name):
+            return True
+        if not model_name:
+            return False
+        try:
+            # local_files_only makes this a pure HF-cache probe: it raises
+            # instead of touching the network when any file is missing.
+            from huggingface_hub import snapshot_download
+            snap = snapshot_download(repo_id=model_name, local_files_only=True)
+        except Exception:
+            return False
+        # The probe alone is too optimistic: refs/main and the snapshot dir
+        # exist as soon as the first small file lands, so an interrupted
+        # first download would count as "available" and resurrect the
+        # blocking main-thread download inside warmup. Require the files
+        # mlx_whisper.load_model actually reads: config.json plus weights
+        # (snapshot symlinks only appear once each blob fully downloads).
+        if not os.path.exists(os.path.join(snap, "config.json")):
+            return False
+        return any(
+            os.path.exists(os.path.join(snap, wf))
+            for wf in ("weights.safetensors", "weights.npz")
+        )
+
     def _publish_runtime_status(self, extra=None):
+        # NOTE: must never take _model_dl_lock — _queue_model_download calls
+        # this while holding it. _model_dl_progress is read as a snapshot.
+        if self._status_publish_stopped:
+            # Death marker already written; late publishers stand down.
+            return
         payload = {
             "build": RUNTIME_BUILD,
             "pid": os.getpid(),
@@ -4602,6 +4819,12 @@ class BloopFlow:
             "model_download_state": self._model_dl_state,
             "model_download_target": self._model_dl_target,
             "model_download_error": self._model_dl_error,
+            "model_download_progress": self._model_dl_progress,
+            "model_ready": self._model_ready,
+            "onboarding_active": self._onboarding_active,
+            "mic_status": self._mic_status,
+            "ax_status": self._ax_status,
+            "hotkey_ready": self._hotkey_ready,
         }
         if isinstance(extra, dict):
             payload.update(extra)
@@ -4719,6 +4942,259 @@ class BloopFlow:
             self._settings_thread.join(timeout=0.2)
         self._settings_thread = None
 
+    # ── Onboarding ────────────────────────────────────────────────────────────
+
+    def _mic_permission_status(self):
+        """Non-prompting mic TCC probe: granted/denied/undetermined/unknown."""
+        try:
+            from AVFoundation import AVCaptureDevice, AVMediaTypeAudio
+            status = int(
+                AVCaptureDevice.authorizationStatusForMediaType_(AVMediaTypeAudio)
+            )
+        except Exception:
+            return "unknown"
+        # 0=notDetermined  1=restricted  2=denied  3=authorized
+        if status == 3:
+            return "granted"
+        if status in (1, 2):
+            return "denied"
+        return "undetermined"
+
+    def _ax_permission_status(self):
+        """Non-prompting Accessibility trust probe: granted/denied."""
+        try:
+            from ApplicationServices import AXIsProcessTrusted
+        except Exception:
+            # Match _check_accessibility: only a frozen .app treats an import
+            # failure as not-granted (bundling issue); dev CLI assumes granted.
+            return "denied" if getattr(sys, "frozen", False) else "granted"
+        try:
+            return "granted" if AXIsProcessTrusted() else "denied"
+        except Exception:
+            return "granted"
+
+    def _refresh_permission_status(self, publish=True):
+        """Re-probe mic/AX (non-prompting); True when either status changed."""
+        mic = self._mic_permission_status()
+        ax = self._ax_permission_status()
+        changed = mic != self._mic_status or ax != self._ax_status
+        self._mic_status = mic
+        self._ax_status = ax
+        if changed and publish:
+            self._publish_runtime_status()
+        return changed
+
+    def _begin_onboarding(self):
+        """Activate the first-run wizard: publish onboarding status, start the
+        ~1s permission re-probe, and point the webview at the wizard view."""
+        # Persist "wizard in flight" before anything else: a relaunch mid-
+        # wizard (the AX step's expected path) must resume here on next boot,
+        # never fall through to the grandfather rule.
+        _onboarding_mark_in_progress()
+        self._onboarding_active = True
+        self._refresh_permission_status(publish=False)
+        self._publish_runtime_status()
+        self._start_onboarding_status_watch()
+        show = getattr(self._history_panel, "show_onboarding", None)
+        if callable(show):
+            try:
+                show()
+            except Exception:
+                pass
+
+    def _finish_onboarding(self):
+        _onboarding_mark_done()
+        self._onboarding_active = False
+        self._onboarding_stop.set()
+        self._publish_runtime_status()
+        self._print("○ Setup complete — hold the hotkey and speak anytime.")
+
+    def _restart_onboarding(self):
+        """Settings 'Run setup again': re-open the wizard. _begin_onboarding
+        rewrites the marker as in-progress (never deletes it — an absent file
+        re-arms the boot grandfather rule and would skip the resumed wizard
+        after a mid-wizard relaunch)."""
+        self._begin_onboarding()
+
+    def _onboarding_status_loop(self):
+        """~1s mic/AX re-probe while the wizard is up; exits on finish."""
+        while not self._onboarding_stop.wait(1.0):
+            if not self._onboarding_active:
+                break
+            changed = self._refresh_permission_status(publish=False)
+            # A mid-setup window close leaves the wizard active with no
+            # visible UI and nothing on screen inviting the user back.
+            # Bring it back exactly once (~3s after the close is detected);
+            # a second close is respected.
+            panel = self._history_panel
+            show_wizard = getattr(panel, "show_onboarding", None)
+            if callable(show_wizard):
+                try:
+                    visible = panel._is_visible()
+                except Exception:
+                    visible = True
+                if visible:
+                    self._onboarding_hidden_ticks = 0
+                else:
+                    ticks = getattr(self, "_onboarding_hidden_ticks", 0) + 1
+                    self._onboarding_hidden_ticks = ticks
+                    if ticks >= 3 and not getattr(self, "_onboarding_reshown", False):
+                        self._onboarding_reshown = True
+                        try:
+                            show_wizard()
+                        except Exception:
+                            pass
+            if self._ax_status == "granted" and not self._hotkey_ready:
+                # AX flipped mid-onboarding: start the hotkey monitor exactly
+                # as boot does — on the UI thread, since the AppKit global
+                # monitor must be installed from the main thread.
+                if self._viz:
+                    self._viz.post_to_ui(self._start_hotkey_monitor)
+                else:
+                    self._start_hotkey_monitor()
+            if changed:
+                self._publish_runtime_status()
+
+    def _start_onboarding_status_watch(self):
+        old = self._onboarding_thread
+        if old is not None and old.is_alive():
+            # A finish + restart landing in one command batch races here: the
+            # finished loop is still inside its final wait(1.0) when the
+            # restart arrives. Retire it first — clearing the stop event
+            # while it lives would hand the old thread the new wizard's stop
+            # signal, and returning early would leave NO watcher running once
+            # it exits (steps then never auto-advance).
+            self._onboarding_stop.set()
+            old.join(timeout=2.0)
+            if old.is_alive():
+                # Wedged watcher (shouldn't happen — the loop only waits on
+                # the event). Keep it rather than racing a second one.
+                return
+        self._onboarding_stop.clear()
+        self._onboarding_thread = threading.Thread(
+            target=self._onboarding_status_loop, daemon=True,
+            name="bloop-onboarding-status",
+        )
+        self._onboarding_thread.start()
+
+    def _ui_command_seq_snapshot(self):
+        try:
+            with open(UI_COMMAND_FILE, "r", encoding="utf-8") as fh:
+                raw = json.load(fh)
+            if isinstance(raw, dict):
+                return int(raw.get("seq") or 0)
+        except Exception:
+            pass
+        return 0
+
+    def _ui_command_watch_loop(self):
+        while not self._ui_cmd_stop.wait(0.5):
+            # The file carries a short "pending" queue (see history_ui's
+            # _ui_command_send): two buttons clicked within one poll window
+            # must both be seen — a single {seq, command} slot dropped the
+            # first click silently.
+            batch = []
+            try:
+                with open(UI_COMMAND_FILE, "r", encoding="utf-8") as fh:
+                    raw = json.load(fh)
+                entries = raw.get("pending")
+                if not isinstance(entries, list):
+                    entries = [raw]
+                for item in entries:
+                    if not isinstance(item, dict):
+                        continue
+                    seq = int(item.get("seq") or 0)
+                    name = str(item.get("command") or "").strip()
+                    if seq <= self._ui_cmd_seq:
+                        continue
+                    batch.append((seq, name))
+            except Exception:
+                continue
+            for seq, name in sorted(batch):
+                self._ui_cmd_seq = max(self._ui_cmd_seq, seq)
+                if name not in ONBOARDING_COMMANDS:
+                    continue
+                try:
+                    self._handle_ui_command(name)
+                except Exception as exc:
+                    _issues_append("ui_command_failed", name, exc=exc)
+
+    def _start_ui_command_watch(self):
+        if self._ui_cmd_thread is not None and self._ui_cmd_thread.is_alive():
+            return
+        # Prime the seq baseline from the file so a stale command left by a
+        # previous session (worst case: relaunch_app) is never replayed here.
+        self._ui_cmd_seq = self._ui_command_seq_snapshot()
+        self._ui_cmd_stop.clear()
+        self._ui_cmd_thread = threading.Thread(
+            target=self._ui_command_watch_loop, daemon=True,
+            name="bloop-ui-command-watch",
+        )
+        self._ui_cmd_thread.start()
+
+    def _stop_ui_command_watch(self):
+        self._ui_cmd_stop.set()
+        if self._ui_cmd_thread is not None:
+            self._ui_cmd_thread.join(timeout=0.2)
+        self._ui_cmd_thread = None
+
+    def _handle_ui_command(self, name):
+        if name == "request_mic":
+            # The prompting TCC check blocks up to 15s waiting on the dialog;
+            # own thread so the command loop stays responsive.
+            threading.Thread(
+                target=self._onboarding_request_mic, daemon=True,
+                name="bloop-onboarding-mic",
+            ).start()
+        elif name == "request_ax":
+            threading.Thread(
+                target=self._onboarding_request_ax, daemon=True,
+                name="bloop-onboarding-ax",
+            ).start()
+        elif name == "open_privacy_mic":
+            self._open_privacy_settings(open_microphone=True)
+        elif name == "open_privacy_ax":
+            self._open_privacy_settings(open_accessibility=True)
+        elif name == "retry_model_download":
+            # Retry the download that actually failed — after a failed model
+            # SWITCH the target differs from the runtime model, and re-queuing
+            # the runtime model would silently "succeed" without fixing it.
+            with self._model_dl_lock:
+                failed_target = (
+                    self._model_dl_target
+                    if self._model_dl_state == "failed" else None
+                )
+            self._queue_model_download(failed_target or self._runtime_model)
+        elif name == "finish_onboarding":
+            self._finish_onboarding()
+        elif name == "restart_onboarding":
+            self._restart_onboarding()
+        elif name == "relaunch_app":
+            self._relaunch_self("onboarding relaunch (hotkey monitor refresh)")
+
+    def _onboarding_request_mic(self):
+        """Wizard 'Allow microphone': fire the prompting TCC check, then
+        republish the freshly probed status."""
+        try:
+            self._check_microphone_permission()
+        except Exception:
+            pass
+        self._refresh_permission_status(publish=False)
+        self._publish_runtime_status()
+
+    def _onboarding_request_ax(self):
+        """Wizard 'Enable accessibility': fire the native AX trust prompt."""
+        try:
+            from ApplicationServices import (
+                AXIsProcessTrustedWithOptions,
+                kAXTrustedCheckOptionPrompt,
+            )
+            AXIsProcessTrustedWithOptions({kAXTrustedCheckOptionPrompt: True})
+        except Exception:
+            pass
+        self._refresh_permission_status(publish=False)
+        self._publish_runtime_status()
+
     def _queue_model_download(self, model_name):
         model_name = (model_name or "").strip()
         if not model_name:
@@ -4745,8 +5221,19 @@ class BloopFlow:
             with self._model_dl_lock:
                 target = self._model_dl_requested
                 self._model_dl_requested = None
-            if not target:
-                break
+                if not target:
+                    # Exit protocol: the no-more-work check and the worker-
+                    # slot release MUST share one lock acquisition. A split
+                    # check/release let _queue_model_download land between
+                    # them, see is_alive() True, and return — the request was
+                    # never consumed and the state sat in "queued" forever.
+                    self._model_dl_thread = None
+                    return
+            # Boot fill: the runtime model itself isn't on disk yet (fresh
+            # install). Nothing is loaded, so completion flows straight into
+            # warmup — a relaunch offer only makes sense when switching away
+            # from a model that is already loaded.
+            boot_fill = target == self._runtime_model
             if self._bundled_model_path(target):
                 self._model_dl_state = "downloaded"
                 self._model_dl_target = target
@@ -4762,16 +5249,25 @@ class BloopFlow:
                     name="bloop-model-relaunch-offer",
                 ).start()
                 continue
-            if target == self._runtime_model:
+            if boot_fill and self._model_is_available(target):
+                # Runtime model already on disk — nothing to download. Loop
+                # back through the atomic exit check above so a request that
+                # queued during the disk probe is still consumed.
+                self._model_ready = True
                 self._model_dl_state = "idle"
                 self._model_dl_target = None
                 self._model_dl_error = None
                 self._publish_runtime_status()
-                break
+                continue
 
             self._model_dl_state = "downloading"
             self._model_dl_target = target
             self._model_dl_error = None
+            with self._model_dl_lock:
+                self._model_dl_progress = {
+                    "percent": -1, "downloaded_mb": 0, "total_mb": 0,
+                }
+                self._model_dl_milestone = 0
             self._publish_runtime_status()
             self._print(f"○ Downloading model in background: {target}")
             try:
@@ -4780,39 +5276,126 @@ class BloopFlow:
                 # PyInstaller .app because sys.executable is the bootloader, not
                 # a Python interpreter.
                 from huggingface_hub import snapshot_download
-                snapshot_download(repo_id=target)
+                dl_kwargs = {}
+                if _ModelDownloadTqdm is not None:
+                    _ModelDownloadTqdm.begin_session(self._on_model_dl_progress)
+                    dl_kwargs["tqdm_class"] = _ModelDownloadTqdm
+                try:
+                    snapshot_download(repo_id=target, **dl_kwargs)
+                finally:
+                    if _ModelDownloadTqdm is not None:
+                        _ModelDownloadTqdm.end_session()
+                with self._model_dl_lock:
+                    self._model_dl_progress = None
                 self._model_dl_state = "downloaded"
                 self._model_dl_target = target
                 self._model_dl_error = None
-                self._print(
-                    f"○ Model downloaded: {target}. Relaunch Blooop to switch."
-                )
-                self._publish_runtime_status()
-                # Console fine print isn't enough — surface the required
-                # relaunch as a native dialog. Own thread so a long-lived
-                # dialog doesn't block this download worker slot.
-                threading.Thread(
-                    target=self._offer_model_relaunch,
-                    args=(target,),
-                    daemon=True,
-                    name="bloop-model-relaunch-offer",
-                ).start()
+                if boot_fill:
+                    self._model_ready = True
+                    self._print(f"○ Model downloaded: {target}. Warming up…")
+                    self._publish_runtime_status()
+                    # mlx.core was already imported on the main thread at boot
+                    # (_init_mlx_core_main_thread), so warmup is safe as an
+                    # ordinary job on the transcribe worker — and any recording
+                    # queued behind it then runs against a warm model.
+                    self._transcribe_queue.put(self._finish_boot_model_fill)
+                else:
+                    self._print(
+                        f"○ Model downloaded: {target}. Relaunch Blooop to switch."
+                    )
+                    self._publish_runtime_status()
+                    # Console fine print isn't enough — surface the required
+                    # relaunch as a native dialog. Own thread so a long-lived
+                    # dialog doesn't block this download worker slot.
+                    threading.Thread(
+                        target=self._offer_model_relaunch,
+                        args=(target,),
+                        daemon=True,
+                        name="bloop-model-relaunch-offer",
+                    ).start()
             except Exception as exc:
+                with self._model_dl_lock:
+                    self._model_dl_progress = None
                 self._model_dl_state = "failed"
                 self._model_dl_target = target
                 self._model_dl_error = str(exc)
                 self._print(f"⚠ Model download failed ({target}): {exc}")
                 self._publish_runtime_status()
 
+    def _on_model_dl_progress(self, downloaded_bytes, total_bytes):
+        """Aggregate-progress callback; called from HF download threads."""
+        if self._status_publish_stopped:
+            return
+        mb = 1024 * 1024
+        downloaded_mb = int(downloaded_bytes // mb)
+        total_mb = int(total_bytes // mb)
+        # The aggregate total grows as per-file metadata arrives; a zero
+        # total means "unknown yet" — report percent -1 (indeterminate bar).
+        percent = min(100, int(downloaded_bytes * 100 // total_bytes)) if total_bytes > 0 else -1
+        milestone = None
         with self._model_dl_lock:
-            self._model_dl_thread = None
+            prev = self._model_dl_progress or {}
+            if (
+                prev.get("percent") == percent
+                and prev.get("downloaded_mb") == downloaded_mb
+                and prev.get("total_mb") == total_mb
+            ):
+                return
+            percent_changed = prev.get("percent") != percent
+            publish = percent_changed or (
+                percent < 0 and prev.get("downloaded_mb") != downloaded_mb
+            )
+            self._model_dl_progress = {
+                "percent": percent,
+                "downloaded_mb": downloaded_mb,
+                "total_mb": total_mb,
+            }
+            if percent >= 0 and percent // 10 > self._model_dl_milestone:
+                self._model_dl_milestone = percent // 10
+                milestone = self._model_dl_milestone * 10
+        if publish:
+            # One small JSON write per whole percent (or per MB while the
+            # total is unknown) — cheap, and the webview polls this file.
+            self._publish_runtime_status()
+        if milestone is not None:
+            self._print(
+                f"○ Model download: {milestone}% ({downloaded_mb}/{total_mb} MB)"
+            )
+
+    def _finish_boot_model_fill(self):
+        """Transcribe-worker job: warm up the freshly downloaded boot model,
+        then retire the download state so the UI stops saying 'warming up'."""
+        self._warmup_whisper()
+        with self._model_dl_lock:
+            # A model switch queued during warmup owns the download state now
+            # (queued/downloading/failed, or downloaded with another target);
+            # only retire it while it still describes this boot fill.
+            if (
+                self._model_dl_state == "downloaded"
+                and self._model_dl_target == self._runtime_model
+            ):
+                self._model_dl_state = "idle"
+                self._model_dl_target = None
+                self._model_dl_error = None
+        self._publish_runtime_status()
 
     def _offer_model_relaunch(self, target):
         """Native dialog offering to relaunch now that the new model is ready."""
-        short = target.rsplit("/", 1)[-1]
+        # The user may have switched the setting back while this download was
+        # in flight (downloads are uncancellable): a dialog for a model they
+        # abandoned is pure confusion — stay quiet, the saved model wins on
+        # the next relaunch anyway.
+        try:
+            saved, _path, _mtime = _settings_load()
+            saved_model = (saved or {}).get("model")
+        except Exception:
+            saved_model = None
+        if saved_model and saved_model != target:
+            return
+        name = _model_display_name(target)
         script = (
-            f'display dialog "New Whisper model ready: {short}. '
-            'Blooop switches models on relaunch — relaunch now?" '
+            f'display dialog "Your new speech model ({name}) is downloaded. '
+            'Relaunch Blooop to start using it?" '
             'with title "Blooop" buttons {"Later", "Relaunch Now"} '
             'default button "Relaunch Now" giving up after 120'
         )
@@ -4952,6 +5535,7 @@ class BloopFlow:
         on its own.
         """
         _issues_append("self_relaunch", reason)
+        self._status_publish_stopped = True
         _runtime_status_update({"pid": None, "stopped": True})
         _release_single_instance_lock()
         try:
@@ -5274,7 +5858,12 @@ class BloopFlow:
                 # Shutdown sentinel pushed from _quit.
                 return
             try:
-                self._transcribe(*job)
+                if callable(job):
+                    # Maintenance job (e.g. post-download warmup) — runs
+                    # serialized with transcriptions on this worker.
+                    job()
+                else:
+                    self._transcribe(*job)
             except Exception as exc:
                 _issues_append(
                     "transcribe_worker_unhandled",
@@ -5354,12 +5943,62 @@ class BloopFlow:
                 return
             self._history_panel.on_app_active_change(bool(active))
 
+    def _refuse_recording_model_not_ready(self):
+        """Friendly refusal while the boot-time model download is in flight.
+
+        A failed download is retried on the hotkey press (one re-queue per
+        press — the user is the retry loop, never a timer).
+        """
+        with self._model_dl_lock:
+            state = self._model_dl_state
+            progress = self._model_dl_progress or {}
+            worker_alive = (
+                self._model_dl_thread is not None
+                and self._model_dl_thread.is_alive()
+            )
+        # "queued" with no live worker is a stranded request (a crash, or a
+        # queue/exit race) — treat it like a failure and re-queue, otherwise
+        # the state can never leave "queued" and every press refuses forever.
+        if state == "failed" or (state == "queued" and not worker_alive):
+            self._print("⚠ Model download failed (no internet?) — retrying…")
+            self._notify_user_throttled(
+                "Model download failed — check your internet. "
+                "Press the hotkey again to retry."
+            )
+            self._queue_model_download(self._runtime_model)
+            return
+        percent = progress.get("percent", -1)
+        if isinstance(percent, int) and percent >= 0:
+            self._print(
+                f"○ Downloading the transcription model ({percent}%) — one moment…"
+            )
+            self._notify_user_throttled(
+                f"Blooop is still downloading its speech model ({percent}%) — "
+                "try again in a minute."
+            )
+        else:
+            self._print("○ Downloading the transcription model — one moment…")
+            self._notify_user_throttled(
+                "Blooop is still downloading its speech model — "
+                "try again in a minute."
+            )
+
     def start_recording(self):
+        # Every refusal below must also disarm latch: a double-tap sets
+        # latched=True before calling here, and a stale latch makes the next
+        # press print "Stopped." instead of retrying (e.g. re-queuing a
+        # failed boot model download).
         if self._audio_wedged:
+            self.latched = False
             self._print("✗ Audio deadlocked — relaunch in progress, one moment…")
             return
         if not self._mlx_runtime_ok:
+            self.latched = False
             self._notify_mlx_unavailable_once()
+            return
+        if not self._model_ready:
+            self.latched = False
+            self._refuse_recording_model_not_ready()
             return
         # A restart during the stop grace tail must not be swallowed by the
         # still-true recording flag: cut the grace short (or wait out an
@@ -5371,9 +6010,14 @@ class BloopFlow:
         try:
             self._ensure_stream()
         except Exception as exc:
+            self.latched = False
             _issues_append("audio_open_failed", "input stream open failed after retry", exc=exc)
             self._print(f"✗ Microphone unavailable: {exc}")
             self._print("  Check the input device, then press the hotkey again.")
+            self._notify_user_throttled(
+                "Blooop can't open the microphone — check Input in Sound "
+                "settings, then try again."
+            )
             return
         with self._lock:
             if self.recording:
@@ -5630,14 +6274,14 @@ class BloopFlow:
                 np.zeros(int(SAMPLE_RATE * WHISPER_TAIL_PAD_SEC), dtype="float32"),
             ])
 
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as fh:
-            tmp = fh.name
         try:
-            sf.write(tmp, model_audio, SAMPLE_RATE)
+            # mlx_whisper.transcribe takes the float32@16kHz array directly;
+            # only its str/path input mode needs ffmpeg, which the standalone
+            # app deliberately avoids depending on.
             w = self._get_whisper()
             initial_prompt = _custom_vocab_initial_prompt(CUSTOM_VOCAB)
             result = w.transcribe(
-                tmp,
+                model_audio,
                 path_or_hf_repo=self._model_source(self._runtime_model),
                 temperature=WHISPER_TEMPERATURE,
                 compression_ratio_threshold=WHISPER_COMPRESSION_RATIO_THRESHOLD,
@@ -5661,11 +6305,6 @@ class BloopFlow:
         except Exception as exc:
             _issues_append("transcribe_failed", "transcribe call failed", exc=exc)
             return "error", "", duration, str(exc)
-        finally:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
 
         if not text:
             if raw_rms < 0.003:
@@ -6132,7 +6771,14 @@ class BloopFlow:
             paste_s = "-"
         else:
             paste_s = "ok" if paste_ok else "fail"
-        msg = _history_compact_message(text, error, max_chars=HISTORY_LIVE_PREVIEW_CHARS)
+        if getattr(sys, "frozen", False):
+            # Standalone builds persist stdout to ~/Library/Logs/Blooop —
+            # never archive transcript text there; length is diagnostic
+            # enough. Full previews stay on for source/terminal runs where
+            # the crash-forensics value is highest.
+            msg = f"{len(text or '')} chars"
+        else:
+            msg = _history_compact_message(text, error, max_chars=HISTORY_LIVE_PREVIEW_CHARS)
         rid = "?" if row_id is None else str(row_id)
         print(f"[H{rid}] {ts}  {status:<9} dur={dur_s:<7} paste={paste_s:<4} {msg}", flush=True)
 
@@ -6161,6 +6807,40 @@ class BloopFlow:
 
     def _print(self, msg):
         print(f"\r{msg:<80}", flush=True)
+
+    def _notify_user(self, message):
+        """Post a macOS notification (standalone .app only).
+
+        In the frozen bundle _print lands in standalone.log where no user
+        ever looks, so hotkey refusals need an on-screen surface. Terminal
+        runs already see the _print feed. Fire-and-forget like
+        _notify_permission_requirements — never block the caller.
+        """
+        if not getattr(sys, "frozen", False):
+            return
+        safe = str(message).replace("\\", " ").replace('"', "'")
+        try:
+            subprocess.Popen(
+                [
+                    "osascript",
+                    "-e",
+                    f'display notification "{safe}" with title "Blooop"',
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+
+    def _notify_user_throttled(self, message, min_interval_sec=15.0):
+        """_notify_user, at most once per min_interval_sec (hotkey mashing
+        while the model downloads must not stack up notification spam)."""
+        now = time.monotonic()
+        last = getattr(self, "_notify_user_last_ts", 0.0)
+        if now - last < min_interval_sec:
+            return
+        self._notify_user_last_ts = now
+        self._notify_user(message)
 
     def _ensure_mlx_runtime(self):
         if self._mlx_probe_checked:
@@ -6222,15 +6902,11 @@ class BloopFlow:
     def _prewarm(self):
         if not self._tx_lock.acquire(timeout=0.05):
             return
-        tmp = None
         try:
             self._get_whisper()
             silent = np.zeros(SAMPLE_RATE // 4, dtype="float32")
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as fh:
-                tmp = fh.name
-            sf.write(tmp, silent, SAMPLE_RATE)
             self._whisper.transcribe(
-                tmp,
+                silent,
                 path_or_hf_repo=self._model_source(self._runtime_model),
                 temperature=WHISPER_TEMPERATURE,
                 compression_ratio_threshold=WHISPER_COMPRESSION_RATIO_THRESHOLD,
@@ -6242,27 +6918,20 @@ class BloopFlow:
         except Exception as exc:
             self._print(f"⚠ Prewarm failed ({exc}) – will load on first use.")
         finally:
-            if tmp is not None:
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
             try:
                 self._tx_lock.release()
             except Exception:
                 pass
 
-    def _prepare_whisper_runtime(self):
-        """Initialize MLX Whisper + first transcribe on main thread.
+    def _init_mlx_core_main_thread(self):
+        """Import mlx.core on the main thread and start the transcribe worker.
 
-        Some MLX builds can abort when `mlx.core` first initializes from a
-        background Python thread. Force the full initialization path here so
-        later worker-thread transcriptions run against an already-initialized
-        runtime.
+        This MUST succeed before any background transcription threads run –
+        nanobind/Metal will abort() if mlx.core is first imported on a
+        non-main thread inside a .app. MLX-runtime health is deliberately
+        decoupled from model availability: success here means mlx is usable,
+        even when the model still has to be downloaded.
         """
-        # Step 1: import mlx.core on the main thread.  This MUST succeed before
-        # any background transcription threads run – nanobind/Metal will abort()
-        # if mlx.core is first imported on a non-main thread inside a .app.
         try:
             import mlx          # noqa: F401
             import mlx.core     # noqa: F401
@@ -6278,10 +6947,29 @@ class BloopFlow:
         # We start it before warmup so any job enqueued during warmup is
         # processed in order.
         self._start_transcribe_worker()
+        return True
 
-        # Step 2: warmup – load model weights + run one dummy inference so the
-        # first real transcription is fast.  Failure here is non-fatal because
-        # mlx.core is already in sys.modules (background threads are safe).
+    def _prepare_whisper_runtime(self):
+        """Initialize MLX Whisper + first transcribe on main thread.
+
+        Some MLX builds can abort when `mlx.core` first initializes from a
+        background Python thread. Force the full initialization path here so
+        later worker-thread transcriptions run against an already-initialized
+        runtime.
+        """
+        if not self._init_mlx_core_main_thread():
+            return False
+        return self._warmup_whisper()
+
+    def _warmup_whisper(self):
+        """Load model weights + run one dummy inference so the first real
+        transcription is fast.
+
+        Failure is non-fatal because mlx.core is already in sys.modules
+        (background threads are safe). Runs on the main thread at boot when
+        the model is on disk, or as a transcribe-worker job right after a
+        boot-time model download completes.
+        """
         # Hold the transcribe lock for the whole warmup: a recording that
         # finishes during warmup is queued to the worker thread, and two
         # threads inside MLX/Metal at once is an intermittent-abort path.
@@ -6289,24 +6977,15 @@ class BloopFlow:
         try:
             w = self._get_whisper()
             silent = np.zeros(SAMPLE_RATE // 8, dtype="float32")
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as fh:
-                tmp = fh.name
-            try:
-                sf.write(tmp, silent, SAMPLE_RATE)
-                w.transcribe(
-                    tmp,
-                    path_or_hf_repo=self._model_source(self._runtime_model),
-                    temperature=WHISPER_TEMPERATURE,
-                    compression_ratio_threshold=WHISPER_COMPRESSION_RATIO_THRESHOLD,
-                    logprob_threshold=WHISPER_LOGPROB_THRESHOLD,
-                    no_speech_threshold=WHISPER_NO_SPEECH_THRESHOLD,
-                    condition_on_previous_text=WHISPER_CONDITION_ON_PREVIOUS_TEXT,
-                )
-            finally:
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
+            w.transcribe(
+                silent,
+                path_or_hf_repo=self._model_source(self._runtime_model),
+                temperature=WHISPER_TEMPERATURE,
+                compression_ratio_threshold=WHISPER_COMPRESSION_RATIO_THRESHOLD,
+                logprob_threshold=WHISPER_LOGPROB_THRESHOLD,
+                no_speech_threshold=WHISPER_NO_SPEECH_THRESHOLD,
+                condition_on_previous_text=WHISPER_CONDITION_ON_PREVIOUS_TEXT,
+            )
             self._mlx_runtime_ok = True
             self._mlx_runtime_error = None
             self._print("○ Whisper runtime initialized.")
@@ -6320,6 +6999,53 @@ class BloopFlow:
         finally:
             self._tx_lock.release()
 
+    def _start_hotkey_monitor(self):
+        """Start the global hotkey monitor (AppKit first, pynput fallback).
+
+        Shared by boot and by the onboarding status loop when Accessibility
+        flips to granted mid-wizard. Idempotent. In .app mode, AppKit monitors
+        are more stable than pynput threads. Returns True once a monitor runs
+        (macOS may still need a relaunch before a freshly trusted process
+        actually receives global events — the wizard offers that relaunch).
+        """
+        if self._hotkey_ready:
+            return True
+        started = False
+        if self._viz:
+            hk = self._hotkey_info()
+            # Funnel hotkey callbacks through the Tk-owned callback queue so
+            # Tk and PortAudio state are touched only from the main thread.
+            mon = MacCommandHotkeyMonitor(
+                on_press=self._handle_ptt_press,
+                on_release=self._handle_ptt_release,
+                key_code=hk["mac_key_code"],
+                modifier=hk["mac_modifier"],
+                schedule=self._viz.post_to_ui,
+            )
+            if mon.start():
+                self._hotkey_monitor = mon
+                started = True
+                print("○ Hotkey monitor: appkit")
+            else:
+                print("⚠ AppKit hotkey monitor unavailable; falling back to pynput.")
+
+        if not started:
+            # Fallback for environments where AppKit global monitor fails.
+            def _listen():
+                with keyboard.Listener(
+                    on_press=self._on_press,
+                    on_release=self._on_release,
+                ) as lst:
+                    lst.join()
+
+            threading.Thread(target=_listen, daemon=True).start()
+            started = True
+            print("○ Hotkey monitor: pynput")
+
+        self._hotkey_ready = started
+        self._publish_runtime_status()
+        return started
+
     # ── Run ───────────────────────────────────────────────────────────────────
 
     def _quit(self):
@@ -6329,7 +7055,10 @@ class BloopFlow:
         self._stop_chunk_worker()
         self._stop_transcribe_worker()
         self._stop_settings_watch()
+        self._stop_ui_command_watch()
+        self._onboarding_stop.set()
         self._close_stream()
+        self._status_publish_stopped = True
         _runtime_status_update({"pid": None, "stopped": True})
         _release_single_instance_lock()
         if self._hotkey_monitor:
@@ -6497,7 +7226,6 @@ class BloopFlow:
 
     def _probe_microphone_input(self):
         # Fallback for CLI / limited AVFoundation environments.
-        probe = None
         try:
             captured = []
 
@@ -6507,15 +7235,27 @@ class BloopFlow:
                 except Exception:
                     pass
 
-            probe = sd.InputStream(
-                samplerate=SAMPLE_RATE,
-                channels=CHANNELS,
-                dtype="float32",
-                callback=_probe_cb,
-            )
-            probe.start()
-            time.sleep(0.5)
-            probe.stop()
+            # This can run on a background thread (onboarding's request_mic);
+            # _reset_portaudio takes _stream_close_lock before sd._terminate(),
+            # so the probe stream's whole open/use/close must hold the same
+            # lock or PortAudio can be yanked out from under it — the native-
+            # crash class that lock exists to prevent.
+            with self._stream_close_lock:
+                probe = sd.InputStream(
+                    samplerate=SAMPLE_RATE,
+                    channels=CHANNELS,
+                    dtype="float32",
+                    callback=_probe_cb,
+                )
+                try:
+                    probe.start()
+                    time.sleep(0.5)
+                    probe.stop()
+                finally:
+                    try:
+                        probe.close()
+                    except Exception:
+                        pass
             if not captured:
                 self._warn_silent_microphone_input()
                 return False
@@ -6533,12 +7273,6 @@ class BloopFlow:
             print("   System Settings → Privacy & Security → Microphone → enable Blooop.")
             print()
             return False
-        finally:
-            if probe is not None:
-                try:
-                    probe.close()
-                except Exception:
-                    pass
 
     def _warn_silent_microphone_input(self, open_settings=False):
         if self._mic_silent_warned:
@@ -6552,36 +7286,6 @@ class BloopFlow:
         print()
         if open_settings:
             self._open_privacy_settings(open_microphone=True)
-
-    def _check_ffmpeg_dependency(self):
-        ffmpeg = _resolve_ffmpeg()
-        if ffmpeg:
-            os.environ["FFMPEG_BINARY"] = ffmpeg
-            return True
-
-        print("✗ Missing dependency: ffmpeg")
-        print("  Install with: brew install ffmpeg")
-        print("  Then relaunch Blooop.")
-        print()
-        try:
-            subprocess.Popen(
-                [
-                    "osascript",
-                    "-e",
-                    (
-                        'display alert "Blooop needs ffmpeg" '
-                        'message "Install ffmpeg in Terminal: brew install ffmpeg. '
-                        'Then relaunch Blooop." '
-                        'buttons {"OK"} default button "OK"'
-                    ),
-                ]
-                ,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except Exception:
-            pass
-        return False
 
     def run(self):
         if not _acquire_single_instance_lock():
@@ -6607,6 +7311,7 @@ class BloopFlow:
 
         self._reload_settings(force=True, announce=False)
         self._start_settings_watch()
+        self._start_ui_command_watch()
 
         hotkey_label = self._hotkey_info()["label"]
         model_label = self._runtime_model
@@ -6615,8 +7320,9 @@ class BloopFlow:
         model_label = model_label[:40]
         print(f"○ Build: {RUNTIME_BUILD}  pid={os.getpid()}")
         print(f"○ Executable: {sys.executable}")
+        banner = f"  Blooop v{APP_VERSION}  –  local Whisper on Apple Silicon"
         print("┌─────────────────────────────────────────────────────┐")
-        print("│  bloop_flow  –  local whisper on Apple Silicon      │")
+        print(f"│{banner:<53}│")
         print("├─────────────────────────────────────────────────────┤")
         print(f"│  model    : {model_label:<40}│")
         print(f"│  PTT      : hold {hotkey_label:<10} → release to transcribe  │")
@@ -6657,82 +7363,115 @@ class BloopFlow:
             except Exception as exc:
                 print(f"⚠ History init failed: {exc}")
 
-        if not self._check_ffmpeg_dependency():
-            self._stop_settings_watch()
-            _release_single_instance_lock()
-            return
+        # First-run onboarding: the webview wizard drives permission prompts
+        # and shows model-download progress, so this boot path must stay
+        # prompt-free. The marker is three-state: absent = fresh install (or
+        # upgrade), {"onboarded": true} = done, {"in_progress": true} = a
+        # wizard was started but never finished — resume it regardless of
+        # permissions (a mid-wizard relaunch after granting AX is the
+        # expected path; grandfathering there would silently skip the
+        # model/try-it steps). Only the Tk fallback panel lacks the wizard —
+        # entering onboarding mode without a wizard UI would suppress the
+        # legacy prompts forever with nothing to replace them.
+        onboarding_needed = (
+            callable(getattr(self._history_panel, "show_onboarding", None))
+            and not bool(_onboarding_state_load().get("onboarded"))
+        )
+        if onboarding_needed:
+            self._mic_status = self._mic_permission_status()
+            self._ax_status = self._ax_permission_status()
+            # Grandfather rule — marker file entirely absent AND mic + AX
+            # already granted means an existing install upgrading in place:
+            # mark onboarded silently, never show the wizard. Model
+            # availability is deliberately NOT part of this check: users
+            # coming from bundled-model builds have both permissions but an
+            # empty HF cache (their model lived inside the .app they just
+            # replaced), and for them the background download plus the
+            # settings progress bar is the right experience, not the wizard.
+            if (
+                not os.path.exists(ONBOARDING_STATE_PATH)
+                and self._mic_status == "granted"
+                and self._ax_status == "granted"
+            ):
+                _onboarding_mark_done()
+                onboarding_needed = False
 
         print("⚙ Initializing runtime…")
         if self._ensure_mlx_runtime():
+            # Warmup would silently BLOCK on a full model download when the
+            # model isn't on disk yet (fresh install): gate it on availability
+            # and let the download machinery schedule the warmup instead.
+            model_ready = self._model_is_available(self._runtime_model)
+            if not model_ready:
+                self._model_ready = False
+                self._publish_runtime_status()
+                print(f"○ Transcription model not on disk yet: {self._runtime_model}")
+                print("  Downloading now — recording unlocks when it finishes.")
+                self._queue_model_download(self._runtime_model)
             if self._viz:
-                # Defer warmup until Tk mainloop is active; some macOS/MLX builds
-                # are more stable once the app event loop is running. The
-                # transcribe worker is started from inside _prepare_whisper_runtime
-                # once mlx.core has been imported on the main thread.
-                self._viz.root.after(120, self._prepare_whisper_runtime)
-                print("○ Whisper warmup: deferred until UI loop starts")
+                # Defer mlx init until Tk mainloop is active; some macOS/MLX
+                # builds are more stable once the app event loop is running.
+                # The transcribe worker is started from inside
+                # _init_mlx_core_main_thread once mlx.core has been imported
+                # on the main thread.
+                if model_ready:
+                    self._viz.root.after(120, self._prepare_whisper_runtime)
+                    print("○ Whisper warmup: deferred until UI loop starts")
+                else:
+                    # Model download in flight: import mlx.core + start the
+                    # worker only; the download loop queues _warmup_whisper
+                    # as a worker job when the model lands.
+                    self._viz.root.after(120, self._init_mlx_core_main_thread)
+                    print("○ Whisper warmup: deferred until model download completes")
             else:
-                self._prepare_whisper_runtime()
+                if model_ready:
+                    self._prepare_whisper_runtime()
+                else:
+                    self._init_mlx_core_main_thread()
             print("○ Transcribe dispatch: worker-thread")
         else:
             self._notify_mlx_unavailable_once()
 
-        mic_ok = self._check_microphone_permission()
-        if not mic_ok:
-            self._print(
-                "⚠ Microphone not granted. Recording disabled until permission is enabled."
-            )
-
-        accessibility_ok = self._check_accessibility()
-        if not accessibility_ok:
-            self._print(
-                "⚠ Accessibility not granted. Hotkeys disabled until permission is enabled."
-            )
-
-        if not mic_ok or not accessibility_ok:
+        if onboarding_needed:
+            # The wizard owns permission prompts: only the non-prompting
+            # probes above ran — no TCC/AX dialogs, no blocking osascript
+            # alert, no auto-opened System Settings on this path.
+            mic_ok = self._mic_status == "granted"
+            accessibility_ok = self._ax_status == "granted"
+        else:
+            mic_ok = self._check_microphone_permission()
             if not mic_ok:
-                self._open_privacy_settings(open_microphone=True)
-            self._notify_permission_requirements(
-                mic_ok=mic_ok,
-                accessibility_ok=accessibility_ok,
-            )
+                self._print(
+                    "⚠ Microphone not granted. Recording disabled until permission is enabled."
+                )
+
+            accessibility_ok = self._check_accessibility()
+            if not accessibility_ok:
+                self._print(
+                    "⚠ Accessibility not granted. Hotkeys disabled until permission is enabled."
+                )
+
+            if not mic_ok or not accessibility_ok:
+                if not mic_ok:
+                    self._open_privacy_settings(open_microphone=True)
+                self._notify_permission_requirements(
+                    mic_ok=mic_ok,
+                    accessibility_ok=accessibility_ok,
+                )
+            self._mic_status = "granted" if mic_ok else "denied"
+            self._ax_status = "granted" if accessibility_ok else "denied"
+            self._publish_runtime_status()
 
         if self._history_panel:
             self._history_panel.start()
             self._history_panel.show()
 
+        if onboarding_needed:
+            self._begin_onboarding()
+
         if self._viz:
-            # In .app mode, AppKit monitors are more stable than pynput threads.
-            hotkey_started = False
             if accessibility_ok:
-                hk = self._hotkey_info()
-                # Funnel hotkey callbacks through the Tk-owned callback queue so
-                # Tk and PortAudio state are touched only from the main thread.
-                mon = MacCommandHotkeyMonitor(
-                    on_press=self._handle_ptt_press,
-                    on_release=self._handle_ptt_release,
-                    key_code=hk["mac_key_code"],
-                    modifier=hk["mac_modifier"],
-                    schedule=self._viz.post_to_ui,
-                )
-                if mon.start():
-                    self._hotkey_monitor = mon
-                    hotkey_started = True
-                    print("○ Hotkey monitor: appkit")
-                else:
-                    print("⚠ AppKit hotkey monitor unavailable; falling back to pynput.")
-
-            if accessibility_ok and not hotkey_started:
-                # Fallback for environments where AppKit global monitor fails.
-                def _listen():
-                    with keyboard.Listener(
-                        on_press=self._on_press,
-                        on_release=self._on_release,
-                    ) as lst:
-                        lst.join()
-
-                threading.Thread(target=_listen, daemon=True).start()
-                print("○ Hotkey monitor: pynput")
+                self._start_hotkey_monitor()
             signal.signal(signal.SIGINT, lambda s, f: self._quit())
 
             # Menu bar icon (Show History / Show Settings / Quit). The Dock
@@ -6759,6 +7498,7 @@ class BloopFlow:
                 "show_history": lambda: _sched_menu(_menu_show_history),
                 "show_settings": lambda: _sched_menu(_menu_show_settings),
                 "quit": lambda: _sched_menu(self._quit),
+                "hotkey_label": self._hotkey_info()["label"],
             })
             if self._menu_bar is not None:
                 print("○ Menu bar icon: on")
@@ -6803,6 +7543,7 @@ class BloopFlow:
             self._close_stream()
 
         self._stop_settings_watch()
+        self._stop_ui_command_watch()
         _release_single_instance_lock()
         print("\n  bye 👋")
 
