@@ -152,8 +152,8 @@ class HistoryUiTests(unittest.TestCase):
         self.assertEqual(
             raw["pending"][-2:],
             [
-                {"seq": first, "command": "request_ax"},
-                {"seq": second, "command": "open_privacy_ax"},
+                {"seq": first, "command": "request_ax", "arg": ""},
+                {"seq": second, "command": "open_privacy_ax", "arg": ""},
             ],
         )
         self.assertLessEqual(len(raw["pending"]), self.ui._UI_COMMAND_PENDING_MAX)
@@ -172,7 +172,8 @@ class HistoryUiTests(unittest.TestCase):
         self.assertIn("send_command", html)
         for command in (
             "request_mic", "request_ax", "open_privacy_mic", "open_privacy_ax",
-            "retry_model_download", "finish_onboarding", "relaunch_app",
+            "choose_model", "retry_model_download", "finish_onboarding",
+            "relaunch_app",
         ):
             self.assertIn(command, html)
         # The wizard polls faster than the 2s data tick while visible.
@@ -222,6 +223,69 @@ class HistoryUiTests(unittest.TestCase):
         self.assertIn("mCont.style.display = modelReady", html)
         self.assertIn(
             "if (obStep === 'model' && modelReady) obScheduleAdvance('try', 900);",
+            html,
+        )
+
+    def test_send_command_bridge_passes_arg(self):
+        # choose_model carries its repo id in an optional "arg" field; seq
+        # semantics stay identical to arg-less commands.
+        self.assertIn("choose_model", self.ui._UI_COMMANDS)
+        api = self.ui.API()
+        res = json.loads(
+            api.send_command("choose_model", "mlx-community/whisper-medium-mlx")
+        )
+        self.assertGreater(res["seq"], 0)
+        with open(self.ui.UI_COMMAND_PATH, encoding="utf-8") as fh:
+            raw = json.load(fh)
+        self.assertEqual(raw["command"], "choose_model")
+        self.assertEqual(raw["arg"], "mlx-community/whisper-medium-mlx")
+        self.assertEqual(
+            raw["pending"][-1],
+            {
+                "seq": res["seq"],
+                "command": "choose_model",
+                "arg": "mlx-community/whisper-medium-mlx",
+            },
+        )
+
+    def test_wizard_model_chooser_cards_with_medium_recommended(self):
+        html = self.ui.HTML
+        for repo in (
+            "mlx-community/whisper-tiny-mlx",
+            "mlx-community/whisper-small-mlx",
+            "mlx-community/whisper-medium-mlx",
+            "mlx-community/whisper-large-v3-mlx",
+        ):
+            self.assertIn(f'data-model="{repo}"', html)
+        for size in ("71 MB", "459 MB", "1.4 GB", "2.9 GB"):
+            self.assertIn(size, html)
+        # Medium is the preselected card and carries the Recommended badge.
+        self.assertIn(
+            'is-selected" role="radio" aria-checked="true" '
+            'data-model="mlx-community/whisper-medium-mlx"',
+            html,
+        )
+        self.assertIn('class="ob-model-badge">Recommended</span>', html)
+        # Download button confirms the choice and sends it with its arg.
+        self.assertIn('id="ob-model-download"', html)
+        self.assertIn("obSend('choose_model', sel.dataset.model)", html)
+
+    def test_wizard_model_chooser_skipped_when_model_ready(self):
+        # Resumed wizard / cache already filled: the step shows the ready
+        # state (or an in-flight download's progress), never the chooser.
+        # The chooser only exists before any download does.
+        html = self.ui.HTML
+        self.assertIn(
+            "const chooserVisible = !modelReady && !obModelChosen "
+            "&& dlState === 'idle';",
+            html,
+        )
+        # Download click flips to the progress view without waiting a poll,
+        # and a fresh wizard run resets the choice back to Medium.
+        self.assertIn("obModelChosen = true;", html)
+        self.assertIn("obModelChosen = false;", html)
+        self.assertIn(
+            '.ob-model-card[data-model="mlx-community/whisper-medium-mlx"]',
             html,
         )
 

@@ -62,6 +62,7 @@ _UI_COMMANDS = frozenset({
     "request_ax",
     "open_privacy_mic",
     "open_privacy_ax",
+    "choose_model",
     "retry_model_download",
     "finish_onboarding",
     "restart_onboarding",
@@ -382,21 +383,26 @@ def _command_state_load():
     return {"raise_seq": 0, "settings_seq": 0, "onboarding_seq": 0}
 
 
-def _ui_command_send(name):
-    """Write {"seq": n, "command": name, "pending": [...]} for the main
-    process to pick up.
+def _ui_command_send(name, arg=None):
+    """Write {"seq": n, "command": name, "arg": optional, "pending": [...]}
+    for the main process to pick up.
 
-    "pending" is a short queue of recent {seq, command} entries, not a single
-    slot: the main process polls at 0.5s, and two buttons clicked within one
-    poll window must both go through (a single slot silently dropped the
-    first click). The seq continues from whatever is on disk so the main
-    process (which dedupes by seq) sees every write as new, even across
-    helper restarts. Returns the written seq, or 0 when the command isn't
-    allowlisted.
+    "pending" is a short queue of recent {seq, command, arg} entries, not a
+    single slot: the main process polls at 0.5s, and two buttons clicked
+    within one poll window must both go through (a single slot silently
+    dropped the first click). The seq continues from whatever is on disk so
+    the main process (which dedupes by seq) sees every write as new, even
+    across helper restarts. Returns the written seq, or 0 when the command
+    isn't allowlisted.
+
+    "arg" (e.g. choose_model's repo id) rides along as an opaque string —
+    the main process validates it against its own fixed list; here it's only
+    length-capped so garbage can't bloat the file.
     """
     name = str(name or "").strip()
     if name not in _UI_COMMANDS:
         return 0
+    arg = str(arg or "").strip()[:128]
     with _UI_COMMAND_LOCK:
         seq = 0
         pending = []
@@ -411,22 +417,30 @@ def _ui_command_send(name):
                         {
                             "seq": int(item.get("seq") or 0),
                             "command": str(item.get("command") or ""),
+                            "arg": str(item.get("arg") or ""),
                         }
                         for item in prev
                         if isinstance(item, dict)
                     ]
                 elif raw.get("command"):
-                    pending = [{"seq": seq, "command": str(raw.get("command"))}]
+                    pending = [{
+                        "seq": seq,
+                        "command": str(raw.get("command")),
+                        "arg": str(raw.get("arg") or ""),
+                    }]
         except Exception:
             pass
         seq += 1
-        pending.append({"seq": seq, "command": name})
+        pending.append({"seq": seq, "command": name, "arg": arg})
         pending = pending[-_UI_COMMAND_PENDING_MAX:]
         os.makedirs(os.path.dirname(UI_COMMAND_PATH), exist_ok=True)
         tmp = f"{UI_COMMAND_PATH}.tmp.{os.getpid()}"
         try:
             with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump({"seq": seq, "command": name, "pending": pending}, fh)
+                json.dump(
+                    {"seq": seq, "command": name, "arg": arg, "pending": pending},
+                    fh,
+                )
             os.replace(tmp, UI_COMMAND_PATH)
         except Exception:
             return 0
@@ -478,9 +492,9 @@ class API:
     def get_command_state(self):
         return json.dumps(_command_state_load())
 
-    def send_command(self, name):
+    def send_command(self, name, arg=None):
         """Webview -> main command channel (onboarding wizard buttons)."""
-        return json.dumps({"seq": _ui_command_send(name)})
+        return json.dumps({"seq": _ui_command_send(name, arg)})
 
     def activate_window(self):
         """Bring this helper app to the front of macOS apps."""
@@ -928,6 +942,61 @@ body.is-booting > .cards { visibility: hidden; }
   margin: 6px 0 14px;
   min-height: 14px;
 }
+.ob-model-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+.ob-model-card {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: var(--surface-2);
+  border: 1px solid var(--border-2);
+  border-radius: 10px;
+  padding: 9px 12px;
+  font: inherit;
+  color: var(--fg);
+  cursor: pointer;
+  transition: border-color 0.12s, background 0.12s;
+}
+.ob-model-card:hover { border-color: var(--violet); }
+.ob-model-card.is-selected {
+  border-color: var(--violet);
+  background: var(--surface);
+  box-shadow: 0 0 0 1px var(--violet);
+}
+.ob-model-head {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+}
+.ob-model-name {
+  font-size: 13px;
+  font-weight: 600;
+}
+.ob-model-size {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--fg-faint);
+}
+.ob-model-badge {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: #14100d;
+  background: var(--coral);
+  border-radius: 99px;
+  padding: 1px 7px 2px;
+}
+.ob-model-desc {
+  display: block;
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--fg-muted);
+}
 .onboarding .runtime-progress { margin-top: 0; }
 .ob-try-card {
   display: none;
@@ -1286,15 +1355,40 @@ body.is-booting > .cards { visibility: hidden; }
     <div class="ob-step" id="ob-step-model">
       <div class="ob-kicker">Step 3 of 4</div>
       <div class="ob-title">Speech model</div>
-      <div class="ob-copy">Blooop needs a speech-recognition model that runs entirely on your Mac &mdash; about 460 MB, downloaded once. After this, everything works offline and nothing you say ever leaves your computer.</div>
-      <div class="ob-state" id="ob-model-state"></div>
-      <div class="runtime-progress" id="ob-model-progress">
-        <div class="runtime-progress-fill" id="ob-model-progress-fill"></div>
+      <div class="ob-copy">Blooop needs a speech-recognition model that runs entirely on your Mac &mdash; downloaded once, then everything works offline and nothing you say ever leaves your computer. Pick one below; you can switch anytime in Settings.</div>
+      <div id="ob-model-chooser">
+        <div class="ob-model-cards" role="radiogroup" aria-label="Speech model">
+          <button class="ob-model-card" role="radio" aria-checked="false" data-model="mlx-community/whisper-tiny-mlx" onclick="obSelectModel(this)">
+            <span class="ob-model-head"><span class="ob-model-name">Tiny</span><span class="ob-model-size">71 MB</span></span>
+            <span class="ob-model-desc">Fastest, least accurate</span>
+          </button>
+          <button class="ob-model-card" role="radio" aria-checked="false" data-model="mlx-community/whisper-small-mlx" onclick="obSelectModel(this)">
+            <span class="ob-model-head"><span class="ob-model-name">Small</span><span class="ob-model-size">459 MB</span></span>
+            <span class="ob-model-desc">Good balance</span>
+          </button>
+          <button class="ob-model-card is-selected" role="radio" aria-checked="true" data-model="mlx-community/whisper-medium-mlx" onclick="obSelectModel(this)">
+            <span class="ob-model-head"><span class="ob-model-name">Medium</span><span class="ob-model-badge">Recommended</span><span class="ob-model-size">1.4 GB</span></span>
+            <span class="ob-model-desc">Best accuracy for everyday dictation</span>
+          </button>
+          <button class="ob-model-card" role="radio" aria-checked="false" data-model="mlx-community/whisper-large-v3-mlx" onclick="obSelectModel(this)">
+            <span class="ob-model-head"><span class="ob-model-name">Large v3</span><span class="ob-model-size">2.9 GB</span></span>
+            <span class="ob-model-desc">Maximum accuracy, slowest download</span>
+          </button>
+        </div>
+        <div class="ob-actions">
+          <button class="ob-btn" id="ob-model-download" onclick="obChooseModel()">Download</button>
+        </div>
       </div>
-      <div class="ob-progress-note" id="ob-model-note"></div>
-      <div class="ob-actions">
-        <button class="ob-btn" id="ob-model-retry" onclick="obSend('retry_model_download')" style="display:none">Retry download</button>
-        <button class="ob-btn" id="ob-model-continue" onclick="obSetStep('try')" style="display:none">Continue</button>
+      <div id="ob-model-dl">
+        <div class="ob-state" id="ob-model-state"></div>
+        <div class="runtime-progress" id="ob-model-progress">
+          <div class="runtime-progress-fill" id="ob-model-progress-fill"></div>
+        </div>
+        <div class="ob-progress-note" id="ob-model-note"></div>
+        <div class="ob-actions">
+          <button class="ob-btn" id="ob-model-retry" onclick="obSend('retry_model_download')" style="display:none">Retry download</button>
+          <button class="ob-btn" id="ob-model-continue" onclick="obSetStep('try')" style="display:none">Continue</button>
+        </div>
       </div>
       <button class="ob-link" onclick="obSetStep('try')">Skip for now</button>
     </div>
@@ -1442,6 +1536,11 @@ const HOTKEY_GLYPHS = {
   right_shift: 'right-\\u21e7',
 };
 let obStep = 'welcome';
+// Set when the model chooser's Download button is clicked: the backend
+// takes up to a poll cycle to flip the download state off "idle", and the
+// chooser must not flash back during that gap.
+let obModelChosen = false;
+let obLastStatus = {};
 let obTryBaseline = null;      // {row id -> status} snapshot at try-step open
 let obTryBaselineLoading = false;
 let obTryEnteredAt = null;     // Date.now() when the try step opened
@@ -1452,8 +1551,26 @@ let obAdvanceTimer = null;
 // (active goes false) or a restart_onboarding seq bump arrives.
 let obFinishSent = false;
 
-function obSend(name) {
-  try { window.pywebview.api.send_command(name); } catch (_) {}
+function obSend(name, arg) {
+  try { window.pywebview.api.send_command(name, arg || ''); } catch (_) {}
+}
+
+function obSelectModel(card) {
+  document.querySelectorAll('.ob-model-card').forEach((el) => {
+    const on = el === card;
+    el.classList.toggle('is-selected', on);
+    el.setAttribute('aria-checked', on ? 'true' : 'false');
+  });
+}
+
+function obChooseModel() {
+  const sel = document.querySelector('.ob-model-card.is-selected');
+  if (!sel) return;
+  obModelChosen = true;
+  obSend('choose_model', sel.dataset.model);
+  // Flip to the progress view immediately; the backend's queued state
+  // arrives on the next poll.
+  obRenderModelStep(obLastStatus);
 }
 
 function obHotkeyGlyph() {
@@ -1512,6 +1629,11 @@ function obShow(show) {
     if (tryInput) tryInput.value = '';
     const stuck = document.getElementById('ob-try-stuck');
     if (stuck) stuck.style.display = 'none';
+    // Model chooser back to its default: Medium preselected, nothing chosen.
+    obModelChosen = false;
+    const medium = document.querySelector(
+      '.ob-model-card[data-model="mlx-community/whisper-medium-mlx"]');
+    if (medium) obSelectModel(medium);
     obStep = null;
     obSetStep('welcome');
   }
@@ -1528,6 +1650,7 @@ function obFinish() {
 }
 
 function updateOnboarding(s) {
+  obLastStatus = s || {};
   const active = !!(s && s.onboarding_active);
   if (!active) obFinishSent = false;
   if (obFinishSent) { obShow(false); return; }
@@ -1587,55 +1710,10 @@ function updateOnboarding(s) {
     axHint.textContent = 'Blooop re-checks automatically after you grant.';
   }
 
-  // Model step
-  const dlState = (s.model_download_state || 'idle');
-  const p = s.model_download_progress;
-  const mState = document.getElementById('ob-model-state');
-  const mBar = document.getElementById('ob-model-progress');
-  const mFill = document.getElementById('ob-model-progress-fill');
-  const mNote = document.getElementById('ob-model-note');
-  const mRetry = document.getElementById('ob-model-retry');
-  const mCont = document.getElementById('ob-model-continue');
-  const downloading = dlState === 'downloading' || dlState === 'queued';
-  const failed = dlState === 'failed';
-  // model_ready is the truth about the RUNTIME model; the download fields
-  // are global and may describe a model SWITCH (reachable via "Run setup
-  // again"). Ready wins: a stale switch-download state must neither show a
-  // phantom "warming up" nor block the wizard behind a failure the runtime
-  // model doesn't have.
+  // Model step (chooser + download progress; also used by the try-step
+  // diagnosis below).
   const modelReady = s.model_ready !== false;
-
-  mRetry.style.display = (failed && !modelReady) ? '' : 'none';
-  mCont.style.display = modelReady ? '' : 'none';
-  mBar.classList.toggle('is-active', !modelReady && downloading);
-  if (modelReady) {
-    mState.textContent = '\\u2713 Model ready';
-    mState.className = 'ob-state is-ok';
-    mNote.textContent = '';
-  } else if (downloading) {
-    const pct = (p && typeof p.percent === 'number') ? p.percent : -1;
-    mBar.classList.toggle('is-indeterminate', pct < 0);
-    mFill.style.width = pct >= 0 ? `${Math.max(0, Math.min(100, pct))}%` : '';
-    mState.textContent = dlState === 'queued' ? 'Preparing download\\u2026' : 'Downloading\\u2026';
-    mState.className = 'ob-state';
-    mNote.textContent = !p ? ''
-      : (pct >= 0 ? `${pct}% \\u2014 ${p.downloaded_mb || 0}/${p.total_mb || 0} MB`
-                  : `${p.downloaded_mb || 0} MB so far`);
-  } else if (failed) {
-    mState.textContent = '\\u2715 Download failed \\u2014 check your internet';
-    mState.className = 'ob-state is-bad';
-    mNote.textContent = 'Check your connection, then click Retry. You can also finish setup now \\u2014 Blooop retries the download whenever you press the hotkey.';
-    if (s.model_download_error) console.log('model download error:', s.model_download_error);
-  } else if (dlState === 'downloaded') {
-    mState.textContent = '\\u2713 Downloaded \\u2014 warming up\\u2026';
-    mState.className = 'ob-state is-ok';
-    mNote.textContent = '';
-  } else {
-    mState.textContent = 'Preparing download\\u2026';
-    mState.className = 'ob-state';
-    mNote.textContent = '';
-  }
-  if (obStep === 'model' && modelReady) obScheduleAdvance('try', 900);
+  obRenderModelStep(s);
 
   // Try-it step copy follows the configured hotkey.
   const glyph = obHotkeyGlyph();
@@ -1668,8 +1746,11 @@ function updateOnboarding(s) {
           + backLink('Go back to the Accessibility step', 'ax');
         tryState.className = 'ob-state is-bad';
       } else if (!modelReady) {
-        tryState.innerHTML = 'Speech model still downloading \\u2014 this step unlocks when it finishes.'
-          + backLink('Back to download progress', 'model');
+        const dlIdle = (s.model_download_state || 'idle') === 'idle' && !obModelChosen;
+        tryState.innerHTML = (dlIdle
+            ? 'No speech model yet \\u2014 pick one to download.'
+            : 'Speech model still downloading \\u2014 this step unlocks when it finishes.')
+          + backLink(dlIdle ? 'Back to the model step' : 'Back to download progress', 'model');
         tryState.className = 'ob-state';
       } else {
         tryState.textContent = 'Listening for your first take\\u2026';
@@ -1685,6 +1766,67 @@ function updateOnboarding(s) {
       stuck.style.display = 'none';
     }
   }
+}
+
+function obRenderModelStep(s) {
+  const dlState = (s.model_download_state || 'idle');
+  const p = s.model_download_progress;
+  const mChooser = document.getElementById('ob-model-chooser');
+  const mDl = document.getElementById('ob-model-dl');
+  const mState = document.getElementById('ob-model-state');
+  const mBar = document.getElementById('ob-model-progress');
+  const mFill = document.getElementById('ob-model-progress-fill');
+  const mNote = document.getElementById('ob-model-note');
+  const mRetry = document.getElementById('ob-model-retry');
+  const mCont = document.getElementById('ob-model-continue');
+  const downloading = dlState === 'downloading' || dlState === 'queued';
+  const failed = dlState === 'failed';
+  // model_ready is the truth about the RUNTIME model; the download fields
+  // are global and may describe a model SWITCH (reachable via "Run setup
+  // again"). Ready wins: a stale switch-download state must neither show a
+  // phantom "warming up" nor block the wizard behind a failure the runtime
+  // model doesn't have.
+  const modelReady = s.model_ready !== false;
+  // The chooser shows only while no download exists at all: model missing,
+  // nothing chosen this session, download state idle. A ready model (resumed
+  // wizard, cache already filled) or any in-flight/failed download goes
+  // straight to the progress view.
+  const chooserVisible = !modelReady && !obModelChosen && dlState === 'idle';
+  if (mChooser) mChooser.style.display = chooserVisible ? '' : 'none';
+  if (mDl) mDl.style.display = chooserVisible ? 'none' : '';
+  if (chooserVisible) return;
+
+  mRetry.style.display = (failed && !modelReady) ? '' : 'none';
+  mCont.style.display = modelReady ? '' : 'none';
+  mBar.classList.toggle('is-active', !modelReady && downloading);
+  if (modelReady) {
+    mState.textContent = '\\u2713 Model ready';
+    mState.className = 'ob-state is-ok';
+    mNote.textContent = '';
+  } else if (downloading) {
+    const pct = (p && typeof p.percent === 'number') ? p.percent : -1;
+    mBar.classList.toggle('is-indeterminate', pct < 0);
+    mFill.style.width = pct >= 0 ? `${Math.max(0, Math.min(100, pct))}%` : '';
+    mState.textContent = dlState === 'queued' ? 'Preparing download\\u2026' : 'Downloading\\u2026';
+    mState.className = 'ob-state';
+    mNote.textContent = !p ? ''
+      : (pct >= 0 ? `${pct}% \\u2014 ${p.downloaded_mb || 0}/${p.total_mb || 0} MB`
+                  : `${p.downloaded_mb || 0} MB so far`);
+  } else if (failed) {
+    mState.textContent = '\\u2715 Download failed \\u2014 check your internet';
+    mState.className = 'ob-state is-bad';
+    mNote.textContent = 'Check your connection, then click Retry. You can also finish setup now \\u2014 Blooop retries the download whenever you press the hotkey.';
+    if (s.model_download_error) console.log('model download error:', s.model_download_error);
+  } else if (dlState === 'downloaded') {
+    mState.textContent = '\\u2713 Downloaded \\u2014 warming up\\u2026';
+    mState.className = 'ob-state is-ok';
+    mNote.textContent = '';
+  } else {
+    mState.textContent = 'Preparing download\\u2026';
+    mState.className = 'ob-state';
+    mNote.textContent = '';
+  }
+  if (obStep === 'model' && modelReady) obScheduleAdvance('try', 900);
 }
 
 async function obTryCaptureBaseline() {

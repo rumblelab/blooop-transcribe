@@ -755,7 +755,8 @@ RUNTIME_STATUS_PATH = os.path.join(STATE_DIR, "runtime_status.json")
 # First-run marker: absent = fresh install (the onboarding wizard runs).
 ONBOARDING_STATE_PATH = os.path.join(STATE_DIR, "onboarding_state.json")
 # Webview -> main command channel (onboarding wizard buttons). The webview
-# writes {"seq": n, "command": name}; the main process polls and dedupes by seq.
+# writes {"seq": n, "command": name, "arg": optional}; the main process polls
+# and dedupes by seq.
 UI_COMMAND_FILE = os.path.join(STATE_DIR, "ui_command.json")
 # Allowlist for ui_command.json; unknown command names are ignored.
 ONBOARDING_COMMANDS = frozenset({
@@ -763,6 +764,7 @@ ONBOARDING_COMMANDS = frozenset({
     "request_ax",
     "open_privacy_mic",
     "open_privacy_ax",
+    "choose_model",
     "retry_model_download",
     "finish_onboarding",
     "restart_onboarding",
@@ -798,6 +800,13 @@ MODEL_DISPLAY_NAMES = {
 
 def _model_display_name(model_id):
     return MODEL_DISPLAY_NAMES.get(model_id, str(model_id).rsplit("/", 1)[-1])
+
+
+# The fixed set of models a user can pick anywhere in the UI. The wizard's
+# choose_model command validates its arg against this in the MAIN process —
+# ui_command.json is world-writable state, so the repo id it carries is
+# untrusted input, never something to hand straight to snapshot_download.
+ONBOARDING_MODEL_CHOICES = frozenset(MODEL_DISPLAY_NAMES)
 
 
 HOTKEY_OPTIONS = {
@@ -5105,17 +5114,18 @@ class BloopFlow:
                         continue
                     seq = int(item.get("seq") or 0)
                     name = str(item.get("command") or "").strip()
+                    arg = str(item.get("arg") or "").strip()
                     if seq <= self._ui_cmd_seq:
                         continue
-                    batch.append((seq, name))
+                    batch.append((seq, name, arg))
             except Exception:
                 continue
-            for seq, name in sorted(batch):
+            for seq, name, arg in sorted(batch):
                 self._ui_cmd_seq = max(self._ui_cmd_seq, seq)
                 if name not in ONBOARDING_COMMANDS:
                     continue
                 try:
-                    self._handle_ui_command(name)
+                    self._handle_ui_command(name, arg)
                 except Exception as exc:
                     _issues_append("ui_command_failed", name, exc=exc)
 
@@ -5138,7 +5148,7 @@ class BloopFlow:
             self._ui_cmd_thread.join(timeout=0.2)
         self._ui_cmd_thread = None
 
-    def _handle_ui_command(self, name):
+    def _handle_ui_command(self, name, arg=None):
         if name == "request_mic":
             # The prompting TCC check blocks up to 15s waiting on the dialog;
             # own thread so the command loop stays responsive.
@@ -5155,6 +5165,8 @@ class BloopFlow:
             self._open_privacy_settings(open_microphone=True)
         elif name == "open_privacy_ax":
             self._open_privacy_settings(open_accessibility=True)
+        elif name == "choose_model":
+            self._onboarding_choose_model(arg)
         elif name == "retry_model_download":
             # Retry the download that actually failed — after a failed model
             # SWITCH the target differs from the runtime model, and re-queuing
@@ -5194,6 +5206,49 @@ class BloopFlow:
             pass
         self._refresh_permission_status(publish=False)
         self._publish_runtime_status()
+
+    def _onboarding_choose_model(self, model_name):
+        """Wizard model chooser: adopt the chosen model and start its download.
+
+        Fresh install (nothing warmed — _model_ready is False only while the
+        boot model was missing on disk): the choice becomes the runtime model
+        itself, so the download runs with boot-fill semantics — no relaunch
+        offer, warmup queued on completion. The settings save persists the
+        choice across relaunches and keeps the settings dropdown honest.
+
+        Guard path: if a model is already warmed (resumed wizard on an
+        installed system), the wizard skips the chooser — but a stale click
+        must still behave sanely, so it falls back to the normal
+        settings-change flow (save; the settings watcher queues the download
+        and offers a relaunch).
+        """
+        model_name = str(model_name or "").strip()
+        if model_name not in ONBOARDING_MODEL_CHOICES:
+            _issues_append(
+                "choose_model_rejected", f"unknown model id: {model_name!r}"
+            )
+            return
+        if self._model_ready:
+            _settings_save({"model": model_name})
+            return
+        with self._settings_lock:
+            self._runtime_model = model_name
+            self._requested_model = model_name
+            # Persist the choice, then move the settings watcher's last-seen
+            # snapshot (settings dict + path + mtime — the same trio
+            # _reload_settings compares) onto the saved state so the watcher
+            # doesn't see our own write as an external model change and queue
+            # a second download. Both updates happen under _settings_lock so
+            # a concurrently polling _reload_settings can't read the file
+            # between the save and the snapshot move.
+            saved, path, mtime = _settings_save({"model": model_name})
+            self._settings = dict(saved)
+            self._settings_path = path
+            self._settings_mtime = mtime
+            _apply_runtime_settings(saved, update_model=True)
+        self._print(f"○ Setup: speech model chosen — {model_name}")
+        self._publish_runtime_status()
+        self._queue_model_download(model_name)
 
     def _queue_model_download(self, model_name):
         model_name = (model_name or "").strip()
@@ -5956,6 +6011,18 @@ class BloopFlow:
                 self._model_dl_thread is not None
                 and self._model_dl_thread.is_alive()
             )
+        # "idle" with no worker means no download was ever chosen: the setup
+        # wizard's model chooser hasn't been used yet (still open, or closed
+        # without picking). Point back at setup instead of pretending a
+        # download is running — and never silently queue a model the user
+        # didn't pick.
+        if state == "idle" and not worker_alive:
+            self._print("○ No speech model yet — finish setup to pick one.")
+            self._notify_user_throttled(
+                "Finish setup in the Blooop window — pick a speech model "
+                "to download."
+            )
+            return
         # "queued" with no live worker is a stranded request (a crash, or a
         # queue/exit race) — treat it like a failure and re-queue, otherwise
         # the state can never leave "queued" and every press refuses forever.
@@ -7406,8 +7473,17 @@ class BloopFlow:
                 self._model_ready = False
                 self._publish_runtime_status()
                 print(f"○ Transcription model not on disk yet: {self._runtime_model}")
-                print("  Downloading now — recording unlocks when it finishes.")
-                self._queue_model_download(self._runtime_model)
+                if onboarding_needed:
+                    # The wizard's model step is a chooser: auto-queueing the
+                    # configured default here would burn half a gig of
+                    # bandwidth on a model the user may not pick. choose_model
+                    # queues the download instead.
+                    print("  Waiting for the setup wizard's model choice.")
+                else:
+                    # Grandfathered/upgrader path (no wizard): keep the
+                    # background download of the configured model.
+                    print("  Downloading now — recording unlocks when it finishes.")
+                    self._queue_model_download(self._runtime_model)
             if self._viz:
                 # Defer mlx init until Tk mainloop is active; some macOS/MLX
                 # builds are more stable once the app event loop is running.

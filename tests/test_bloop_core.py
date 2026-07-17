@@ -1380,6 +1380,131 @@ class BloopCoreTests(unittest.TestCase):
         # The armed double-tap latch must not swallow the next retry press.
         self.assertFalse(flow.latched)
 
+    def test_hotkey_before_model_choice_points_back_to_setup(self):
+        # Fresh install, wizard shown but no model chosen yet (download state
+        # never left "idle"): a hotkey press must point back at setup, not
+        # silently queue the default model the user never picked.
+        bloop = self.bloop
+        flow = object.__new__(bloop.BloopFlow)
+        flow._audio_wedged = False
+        flow._mlx_runtime_ok = True
+        flow._model_ready = False
+        flow._model_dl_lock = threading.Lock()
+        flow._model_dl_state = "idle"
+        flow._model_dl_thread = None
+        flow._model_dl_progress = None
+        flow.latched = True
+        printed = []
+        flow._print = printed.append
+        notified = []
+        flow._notify_user_throttled = notified.append
+        requeued = []
+        flow._queue_model_download = requeued.append
+
+        flow.start_recording()
+        self.assertEqual(requeued, [])
+        self.assertIn("finish setup", printed[0].lower())
+        self.assertIn("pick a speech model", notified[0])
+        self.assertFalse(flow.latched)
+
+    def test_boot_skips_model_auto_queue_when_wizard_will_run(self):
+        # Auto-downloading DEFAULT_MODEL at boot while the wizard's model
+        # chooser is about to run wastes the whole download when the user
+        # picks a different model — the choice queues the download instead.
+        # The grandfathered/upgrader path (no wizard) keeps the auto-queue.
+        src = inspect.getsource(self.bloop.BloopFlow.run)
+        gate_idx = src.index("if not model_ready:")
+        branch_idx = src.index("if onboarding_needed:", gate_idx)
+        else_idx = src.index("else:", branch_idx)
+        queue_idx = src.index(
+            "self._queue_model_download(self._runtime_model)", gate_idx
+        )
+        self.assertLess(branch_idx, else_idx)
+        self.assertLess(else_idx, queue_idx)
+        self.assertIn("setup wizard", src[branch_idx:else_idx])
+
+    def test_choose_model_arg_validated_against_fixed_list(self):
+        bloop = self.bloop
+        self.assertIn("choose_model", bloop.ONBOARDING_COMMANDS)
+        self.assertEqual(
+            bloop.ONBOARDING_MODEL_CHOICES,
+            frozenset({
+                "mlx-community/whisper-tiny-mlx",
+                "mlx-community/whisper-small-mlx",
+                "mlx-community/whisper-medium-mlx",
+                "mlx-community/whisper-large-v3-mlx",
+            }),
+        )
+        # Unknown repo ids are rejected in the MAIN process before touching
+        # any state — ui_command.json is untrusted input.
+        flow = object.__new__(bloop.BloopFlow)
+        queued = []
+        flow._queue_model_download = queued.append
+        for bad in ("mlx-community/evil-model", "", None, "whisper-medium"):
+            flow._onboarding_choose_model(bad)
+        self.assertEqual(queued, [])
+
+    def _make_choose_model_flow(self):
+        bloop = self.bloop
+        flow = object.__new__(bloop.BloopFlow)
+        flow._settings_lock = threading.Lock()
+        flow._settings = bloop._settings_defaults()
+        flow._settings_path = None
+        flow._settings_mtime = None
+        flow._runtime_model = bloop.DEFAULT_MODEL
+        flow._requested_model = bloop.DEFAULT_MODEL
+        flow._hotkey_name = bloop.DEFAULT_HOTKEY
+        flow._hotkey_monitor = None
+        flow._ptt_key = bloop.HOTKEY_OPTIONS[bloop.DEFAULT_HOTKEY]["pynput_key"]
+        flow.latched = False
+        flow.recording = False
+        flow._print = lambda *_a: None
+        flow._publish_runtime_status = lambda *_a, **_k: None
+        flow._queued = []
+        flow._queue_model_download = flow._queued.append
+        return flow
+
+    def test_choose_model_boot_fill_sets_runtime_requested_and_settings(self):
+        # Fresh install (nothing warmed): the choice becomes runtime AND
+        # requested model, is persisted to settings, and the download runs
+        # with boot-fill semantics (target == runtime model).
+        bloop = self.bloop
+        flow = self._make_choose_model_flow()
+        flow._model_ready = False
+
+        flow._onboarding_choose_model("mlx-community/whisper-medium-mlx")
+        self.assertEqual(flow._runtime_model, "mlx-community/whisper-medium-mlx")
+        self.assertEqual(flow._requested_model, "mlx-community/whisper-medium-mlx")
+        self.assertEqual(flow._queued, ["mlx-community/whisper-medium-mlx"])
+        # Boot fill: the download target IS the runtime model, so
+        # _model_download_loop takes the no-relaunch, warmup-on-completion
+        # path.
+        self.assertEqual(flow._queued[0], flow._runtime_model)
+        saved, _path, _mtime = bloop._settings_load()
+        self.assertEqual(saved["model"], "mlx-community/whisper-medium-mlx")
+        # Echo guard: the handler moved the settings watcher's last-seen
+        # snapshot onto its own save, so the next watcher poll must see no
+        # change and must not queue a second download.
+        self.assertFalse(flow._reload_settings(force=False, announce=False))
+        self.assertEqual(flow._queued, ["mlx-community/whisper-medium-mlx"])
+
+    def test_choose_model_with_warm_model_falls_back_to_settings_path(self):
+        # Resumed wizard on an installed system (model already warmed): the
+        # chooser is skipped in the UI, but a stale click must fall back to
+        # the ordinary settings-change flow — save only, let the settings
+        # watcher queue the download and offer the relaunch. Runtime model
+        # stays untouched.
+        bloop = self.bloop
+        flow = self._make_choose_model_flow()
+        flow._model_ready = True
+
+        flow._onboarding_choose_model("mlx-community/whisper-large-v3-mlx")
+        self.assertEqual(flow._runtime_model, bloop.DEFAULT_MODEL)
+        self.assertEqual(flow._requested_model, bloop.DEFAULT_MODEL)
+        self.assertEqual(flow._queued, [])
+        saved, _path, _mtime = bloop._settings_load()
+        self.assertEqual(saved["model"], "mlx-community/whisper-large-v3-mlx")
+
     def test_runtime_status_publishes_model_download_progress(self):
         src = inspect.getsource(self.bloop.BloopFlow._publish_runtime_status)
         self.assertIn('"model_download_progress": self._model_dl_progress', src)
@@ -1523,8 +1648,8 @@ class BloopCoreTests(unittest.TestCase):
             self.bloop.ONBOARDING_COMMANDS,
             frozenset({
                 "request_mic", "request_ax", "open_privacy_mic",
-                "open_privacy_ax", "retry_model_download", "finish_onboarding",
-                "restart_onboarding", "relaunch_app",
+                "open_privacy_ax", "choose_model", "retry_model_download",
+                "finish_onboarding", "restart_onboarding", "relaunch_app",
             }),
         )
         src = inspect.getsource(self.bloop.BloopFlow._ui_command_watch_loop)
@@ -1552,8 +1677,8 @@ class BloopCoreTests(unittest.TestCase):
         flow._ui_cmd_seq = 0
         handled = []
 
-        def handle(name):
-            handled.append(name)
+        def handle(name, arg=None):
+            handled.append((name, arg))
             if len(handled) >= 2:
                 flow._ui_cmd_stop.set()
 
@@ -1564,10 +1689,15 @@ class BloopCoreTests(unittest.TestCase):
                 json.dump(
                     {
                         "seq": 2,
-                        "command": "open_privacy_ax",
+                        "command": "choose_model",
+                        "arg": "mlx-community/whisper-medium-mlx",
                         "pending": [
                             {"seq": 1, "command": "request_ax"},
-                            {"seq": 2, "command": "open_privacy_ax"},
+                            {
+                                "seq": 2,
+                                "command": "choose_model",
+                                "arg": "mlx-community/whisper-medium-mlx",
+                            },
                         ],
                     },
                     fh,
@@ -1586,7 +1716,14 @@ class BloopCoreTests(unittest.TestCase):
                 os.unlink(bloop.UI_COMMAND_FILE)
             except OSError:
                 pass
-        self.assertEqual(handled, ["request_ax", "open_privacy_ax"])
+        # Both commands arrive in order, and choose_model's arg rides along.
+        self.assertEqual(
+            handled,
+            [
+                ("request_ax", ""),
+                ("choose_model", "mlx-community/whisper-medium-mlx"),
+            ],
+        )
         self.assertEqual(flow._ui_cmd_seq, 2)
 
     def test_finish_onboarding_writes_marker_and_stops_poll(self):

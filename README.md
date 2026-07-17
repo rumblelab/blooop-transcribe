@@ -14,7 +14,7 @@ No cloud. No subscription. No account. Your voice never leaves your machine.
 
 Download **[Blooop-1.0.0.zip](https://blooop.lol)** (~160 MB), unzip, and drag **Blooop** into your **Applications** folder. Then open it -- on the first open, click "Open" on the macOS "downloaded from the internet" dialog, and that's it.
 
-A short setup wizard walks you through the two macOS permissions and downloads the speech model (~460 MB, one time). After that everything runs offline.
+A short setup wizard walks you through the two macOS permissions, then you pick a speech model to download (one time) -- Medium (1.4 GB) is recommended; Small (459 MB) if you're short on disk or bandwidth. After that everything runs offline.
 
 Prefer to run from source? See [Running from source](#running-from-source) below.
 
@@ -57,7 +57,7 @@ No cloud. No account. Audio never leaves your Mac -- transcription runs entirely
 
 ## Settings
 
-Click the Blooop icon in the menu bar -> Show Settings. You can switch models (Tiny ~80 MB fastest · Small ~460 MB recommended · Medium ~1.5 GB · Large v3 ~3 GB most accurate), change the push-to-talk key, toggle auto-paste, adjust mic sensitivity, and add custom vocabulary -- no config files.
+Click the Blooop icon in the menu bar -> Show Settings. You can switch models (Tiny ~80 MB fastest · Small ~460 MB · Medium ~1.5 GB recommended · Large v3 ~3 GB most accurate), change the push-to-talk key, toggle auto-paste, adjust mic sensitivity, and add custom vocabulary -- no config files.
 
 ## Works with
 
