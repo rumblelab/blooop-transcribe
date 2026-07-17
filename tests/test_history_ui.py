@@ -77,6 +77,16 @@ class HistoryUiTests(unittest.TestCase):
         self.assertEqual(saved["latch_chunk_seconds"], 25.0)
         self.assertIs(saved["latch_chunk_mode"], True)
 
+    def test_latch_chunk_mode_is_unconditional(self):
+        # Silent latch chunking has no toggle at all: a stored false (someone
+        # unchecked the old toggle in a previous version) normalizes to True.
+        out = self.ui._settings_normalize({"latch_chunk_mode": False})
+        self.assertIs(out["latch_chunk_mode"], True)
+        out = self.ui._settings_normalize({"latch_chunk_mode": "bogus"})
+        self.assertIs(out["latch_chunk_mode"], True)
+        out = self.ui._settings_normalize({})
+        self.assertIs(out["latch_chunk_mode"], True)
+
     def test_webview_form_exposes_vocab_pill_and_clear(self):
         html = self.ui.HTML
         self.assertIn('id="s-vocab"', html)
