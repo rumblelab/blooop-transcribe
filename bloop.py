@@ -564,10 +564,10 @@ APP_VERSION = "1.0.0"
 RUNTIME_BUILD = "2026-07-09-pill-rebuild-and-echo-filter"
 
 # MLX Whisper model from HuggingFace (downloaded on first use, cached after).
-# Faster / smaller  →  mlx-community/whisper-tiny-mlx   (~80 MB)
-# Good balance      →  mlx-community/whisper-small-mlx  (~460 MB)  ← current
-# Higher accuracy   →  mlx-community/whisper-medium-mlx (~1.5 GB)
-# Best quality      →  mlx-community/whisper-large-v3-mlx (~3 GB)
+# Faster / smaller  →  mlx-community/whisper-tiny-mlx   (71 MB)
+# Good balance      →  mlx-community/whisper-small-mlx  (459 MB)  ← current
+# Higher accuracy   →  mlx-community/whisper-medium-mlx (1.4 GB)
+# Best quality      →  mlx-community/whisper-large-v3-mlx (2.9 GB)
 MODEL = "mlx-community/whisper-small-mlx"
 
 # Push-to-talk: hold right Command (avoids clobbering terminal Ctrl-C).
@@ -913,9 +913,10 @@ def _settings_normalize(raw):
     if isinstance(auto_paste, bool):
         out["auto_paste"] = auto_paste
 
-    latch_chunk_mode = raw.get("latch_chunk_mode")
-    if isinstance(latch_chunk_mode, bool):
-        out["latch_chunk_mode"] = latch_chunk_mode
+    # Silent latch chunking is unconditional now — no toggle, not even a hidden
+    # settings key. Coerce a stored false (an unchecked old toggle) back to True
+    # so those users get chunking back. latch_chunk_seconds stays file-tunable.
+    out["latch_chunk_mode"] = True
 
     chunk_sec = raw.get("latch_chunk_seconds")
     try:
@@ -942,9 +943,9 @@ def _settings_normalize(raw):
     if isinstance(pill, bool):
         out["pill_window"] = pill
 
-    pill_style = raw.get("pill_style")
-    if isinstance(pill_style, str) and pill_style in PILL_STYLES:
-        out["pill_style"] = pill_style
+    # Bubbles is the only pill style now. Coerce any stored value (e.g. an old
+    # "spectrogram") back to "bubbles" so legacy settings files render bubbles.
+    out["pill_style"] = "bubbles"
 
     if "custom_vocab" in raw:
         out["custom_vocab"] = _normalize_custom_vocab(raw.get("custom_vocab"))
@@ -3418,9 +3419,7 @@ class HistoryPanel:
         self._silence_var = tk.StringVar(value=DEFAULT_SILENCE_PRESET)
         self._mic_sensitivity_var = tk.StringVar(value=DEFAULT_MIC_SENSITIVITY)
         self._auto_paste_var = tk.BooleanVar(value=True)
-        self._latch_mode_var = tk.BooleanVar(value=True)
         self._pill_window_var = tk.BooleanVar(value=True)
-        self._chunk_sec_var = tk.StringVar(value="10.0")
 
     def _configure_styles(self):
         if self._style_ready or ttk is None:
@@ -3567,15 +3566,6 @@ class HistoryPanel:
         hotkey = self._hotkey_var.get().strip()
         silence = self._silence_var.get().strip()
         mic_sensitivity = self._mic_sensitivity_var.get().strip()
-        chunk_raw = self._chunk_sec_var.get().strip()
-
-        try:
-            chunk = float(chunk_raw)
-            if not math.isfinite(chunk):
-                raise ValueError("non-finite")
-            chunk_value = min(60.0, max(2.0, chunk))
-        except Exception:
-            chunk_value = f"invalid:{chunk_raw}"
 
         if self._custom_vocab_text is not None:
             custom_vocab = _normalize_custom_vocab(self._custom_vocab_text.get("1.0", "end"))
@@ -3594,8 +3584,6 @@ class HistoryPanel:
                 else f"invalid:{mic_sensitivity}"
             ),
             "auto_paste": bool(self._auto_paste_var.get()),
-            "latch_chunk_mode": bool(self._latch_mode_var.get()),
-            "latch_chunk_seconds": chunk_value,
             "pill_window": bool(self._pill_window_var.get()),
             "custom_vocab": custom_vocab,
         }
@@ -3679,13 +3667,7 @@ class HistoryPanel:
                 cur.get("mic_sensitivity", DEFAULT_MIC_SENSITIVITY)
             )
             self._auto_paste_var.set(bool(cur.get("auto_paste", True)))
-            self._latch_mode_var.set(bool(cur.get("latch_chunk_mode", True)))
             self._pill_window_var.set(bool(cur.get("pill_window", True)))
-            try:
-                chunk = float(cur.get("latch_chunk_seconds", 10.0))
-            except Exception:
-                chunk = 10.0
-            self._chunk_sec_var.set(f"{chunk:.1f}")
             if self._custom_vocab_text is not None:
                 self._set_text_widget(
                     self._custom_vocab_text,
@@ -3711,28 +3693,22 @@ class HistoryPanel:
         if mic_sensitivity not in MIC_SENSITIVITY_PRESETS:
             mic_sensitivity = DEFAULT_MIC_SENSITIVITY
 
-        try:
-            chunk = float(self._chunk_sec_var.get().strip())
-            if not math.isfinite(chunk):
-                raise ValueError("non-finite")
-        except Exception:
-            self._set_msg("Chunk seconds must be a number (2-60).")
-            return
-
         custom_vocab = list(DEFAULT_CUSTOM_VOCAB)
         if self._custom_vocab_text is not None:
             custom_vocab = _normalize_custom_vocab(
                 self._custom_vocab_text.get("1.0", "end")
             )
 
+        # Latch chunking is intentionally absent: it is unconditional now
+        # (normalize forces latch_chunk_mode True), and _settings_save merges
+        # this dict over the stored settings, so a hand-edited
+        # latch_chunk_seconds is preserved.
         out = {
             "model": model,
             "hotkey": hotkey,
             "silence_trim_preset": silence,
             "mic_sensitivity": mic_sensitivity,
             "auto_paste": bool(self._auto_paste_var.get()),
-            "latch_chunk_mode": bool(self._latch_mode_var.get()),
-            "latch_chunk_seconds": min(60.0, max(2.0, chunk)),
             "pill_window": bool(self._pill_window_var.get()),
             "custom_vocab": custom_vocab,
         }
@@ -3745,9 +3721,7 @@ class HistoryPanel:
                 saved.get("mic_sensitivity", DEFAULT_MIC_SENSITIVITY)
             )
             self._auto_paste_var.set(bool(saved["auto_paste"]))
-            self._latch_mode_var.set(bool(saved["latch_chunk_mode"]))
             self._pill_window_var.set(bool(saved.get("pill_window", True)))
-            self._chunk_sec_var.set(f"{float(saved['latch_chunk_seconds']):.1f}")
             if self._custom_vocab_text is not None:
                 self._set_text_widget(
                     self._custom_vocab_text,
@@ -4105,15 +4079,6 @@ class HistoryPanel:
             text="Auto paste",
             variable=self._auto_paste_var,
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        ttk.Checkbutton(
-            settings,
-            text="Latch chunk mode",
-            variable=self._latch_mode_var,
-        ).grid(row=1, column=2, columnspan=2, sticky="w", pady=(8, 0))
-        ttk.Label(settings, text="Chunk sec").grid(row=1, column=4, sticky="w", pady=(8, 0))
-        ttk.Entry(settings, textvariable=self._chunk_sec_var, width=8).grid(
-            row=1, column=5, sticky="w", padx=(6, 0), pady=(8, 0)
-        )
 
         ttk.Label(settings, text="Mic sensitivity").grid(
             row=2, column=0, sticky="w", pady=(8, 0)
@@ -4127,7 +4092,7 @@ class HistoryPanel:
 
         ttk.Checkbutton(
             settings,
-            text="Show recording pill (restart to apply)",
+            text="Show a floating indicator while recording",
             variable=self._pill_window_var,
         ).grid(row=3, column=0, columnspan=6, sticky="w", pady=(8, 0))
 
@@ -4167,9 +4132,7 @@ class HistoryPanel:
             self._silence_var,
             self._mic_sensitivity_var,
             self._auto_paste_var,
-            self._latch_mode_var,
             self._pill_window_var,
-            self._chunk_sec_var,
         ):
             var.trace_add("write", self._on_settings_field_changed)
         self._custom_vocab_text.bind("<<Modified>>", self._on_custom_vocab_modified, add="+")

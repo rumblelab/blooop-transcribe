@@ -142,7 +142,9 @@ class BloopCoreTests(unittest.TestCase):
         )
         self.assertEqual(out["model"], self.bloop.DEFAULT_MODEL)
         self.assertEqual(out["auto_paste"], True)
-        self.assertEqual(out["latch_chunk_mode"], False)
+        # Silent latch chunking is unconditional: a stored false (an unchecked
+        # old toggle) is coerced back to True.
+        self.assertEqual(out["latch_chunk_mode"], True)
         self.assertEqual(out["latch_chunk_seconds"], 60.0)
         self.assertEqual(out["silence_trim_preset"], "aggressive")
         self.assertEqual(out["hotkey"], "right_option")
@@ -994,13 +996,16 @@ class BloopCoreTests(unittest.TestCase):
         self.assertIn("_looks_like_prompt_echo(text, initial_prompt)", src)
         self.assertIn('"segments_filtered"', src)
 
-    def test_pill_style_setting_round_trip(self):
+    def test_pill_style_always_normalizes_to_bubbles(self):
+        # Bubbles is the only pill style now: normalize coerces any stored value
+        # (including a legacy "spectrogram") to "bubbles" so old settings files
+        # render bubbles.
         out = self.bloop._settings_normalize({"pill_style": "spectrogram"})
-        self.assertEqual(out["pill_style"], "spectrogram")
+        self.assertEqual(out["pill_style"], "bubbles")
         out = self.bloop._settings_normalize({"pill_style": "nonsense"})
         self.assertEqual(out["pill_style"], "bubbles")
-        self.assertIn("bubbles", self.bloop.PILL_STYLE_DIMS)
-        self.assertIn("spectrogram", self.bloop.PILL_STYLE_DIMS)
+        out = self.bloop._settings_normalize({})
+        self.assertEqual(out["pill_style"], "bubbles")
 
     def test_menu_bar_level_repaints_only_on_bucket_change(self):
         src = inspect.getsource(self.bloop._BloopMenuBarController.set_level)

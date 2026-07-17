@@ -68,6 +68,15 @@ class HistoryUiTests(unittest.TestCase):
         saved = self.ui._settings_save({"auto_paste": False})
         self.assertIs(saved["pill_window"], False)
 
+    def test_save_preserves_hand_edited_latch_chunk_seconds(self):
+        # The form no longer surfaces latch chunking, but a power user may set
+        # latch_chunk_seconds by hand in settings.json. A form save (which omits
+        # the key) must merge over the stored value, not reset it to the default.
+        self.ui._settings_save({"latch_chunk_seconds": 25.0})
+        saved = self.ui._settings_save({"auto_paste": False})
+        self.assertEqual(saved["latch_chunk_seconds"], 25.0)
+        self.assertIs(saved["latch_chunk_mode"], True)
+
     def test_webview_form_exposes_vocab_pill_and_clear(self):
         html = self.ui.HTML
         self.assertIn('id="s-vocab"', html)
@@ -89,12 +98,19 @@ class HistoryUiTests(unittest.TestCase):
     def test_api_exposes_clear_history(self):
         self.assertTrue(callable(getattr(self.ui.API, "clear_history", None)))
 
-    def test_pill_style_normalize_and_form(self):
+    def test_pill_style_always_bubbles_and_form_dropdown_gone(self):
+        # Bubbles is the only pill style now: any stored value is coerced to
+        # "bubbles" so legacy settings files (e.g. an old "spectrogram") still
+        # render bubbles, and the indicator-style dropdown is gone from the form.
         out = self.ui._settings_normalize({"pill_style": "spectrogram"})
-        self.assertEqual(out["pill_style"], "spectrogram")
+        self.assertEqual(out["pill_style"], "bubbles")
         out = self.ui._settings_normalize({"pill_style": "bogus"})
         self.assertEqual(out["pill_style"], "bubbles")
-        self.assertIn('id="s-pillstyle"', self.ui.HTML)
+        out = self.ui._settings_normalize({})
+        self.assertEqual(out["pill_style"], "bubbles")
+        self.assertNotIn('id="s-pillstyle"', self.ui.HTML)
+        # The pill on/off checkbox stays.
+        self.assertIn('id="s-pill"', self.ui.HTML)
 
     def test_mic_sensitivity_normalize_and_form(self):
         out = self.ui._settings_normalize({"mic_sensitivity": "high"})

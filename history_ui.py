@@ -84,7 +84,6 @@ _SETTINGS_DEFAULTS = {
 _SILENCE_PRESETS = {"off", "normal", "aggressive"}
 _MIC_SENSITIVITIES = {"high", "normal", "low"}
 _HOTKEYS = {"right_cmd", "right_option", "right_shift"}
-_PILL_STYLES = {"bubbles", "spectrogram"}
 
 
 def _set_process_program_name(name="Blooop History"):
@@ -288,14 +287,16 @@ def _settings_normalize(raw):
 
     if isinstance(raw.get("auto_paste"), bool):
         out["auto_paste"] = raw["auto_paste"]
-    if isinstance(raw.get("latch_chunk_mode"), bool):
-        out["latch_chunk_mode"] = raw["latch_chunk_mode"]
+    # Silent latch chunking is unconditional now — no toggle, not even a hidden
+    # settings key. Coerce a stored false (an unchecked old toggle) back to True
+    # so those users get chunking back. latch_chunk_seconds stays file-tunable.
+    out["latch_chunk_mode"] = True
     if isinstance(raw.get("pill_window"), bool):
         out["pill_window"] = raw["pill_window"]
 
-    pill_style = raw.get("pill_style")
-    if isinstance(pill_style, str) and pill_style in _PILL_STYLES:
-        out["pill_style"] = pill_style
+    # Bubbles is the only pill style now. Coerce any stored value (e.g. an old
+    # "spectrogram") back to "bubbles" so legacy settings files render bubbles.
+    out["pill_style"] = "bubbles"
 
     try:
         sec = float(raw.get("latch_chunk_seconds"))
@@ -666,9 +667,10 @@ body {
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--surface);
-  padding: 10px;
-  overflow: hidden;
-  max-height: 560px;
+  padding: 10px 10px 18px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  max-height: 640px;
   opacity: 1;
   transform: translateY(0);
   transition: max-height 0.2s ease, opacity 0.16s ease, transform 0.16s ease, margin 0.16s ease, padding 0.16s ease;
@@ -737,9 +739,13 @@ body {
 }
 .check-row {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 6px;
   color: var(--fg);
+}
+.check-row input[type="checkbox"] {
+  margin-top: 1px;
+  flex: 0 0 auto;
 }
 .settings-hint {
   margin-top: 8px;
@@ -1222,10 +1228,10 @@ body.is-booting > .cards { visibility: hidden; }
     <div class="field full">
       <label for="s-model">Speech model</label>
       <select id="s-model">
-        <option value="mlx-community/whisper-tiny-mlx">Tiny &mdash; fastest, lowest accuracy (~80 MB)</option>
-        <option value="mlx-community/whisper-small-mlx">Small &mdash; fast, good accuracy (~460 MB)</option>
-        <option value="mlx-community/whisper-medium-mlx">Medium &mdash; slower, better accuracy (~1.5 GB)</option>
-        <option value="mlx-community/whisper-large-v3-mlx">Large v3 &mdash; slowest, best accuracy (~3 GB)</option>
+        <option value="mlx-community/whisper-tiny-mlx">Tiny &mdash; fastest, lowest accuracy (71 MB)</option>
+        <option value="mlx-community/whisper-small-mlx">Small &mdash; fast, good accuracy (459 MB)</option>
+        <option value="mlx-community/whisper-medium-mlx">Medium &mdash; slower, better accuracy (1.4 GB)</option>
+        <option value="mlx-community/whisper-large-v3-mlx">Large v3 &mdash; slowest, best accuracy (2.9 GB)</option>
       </select>
     </div>
 
@@ -1265,32 +1271,11 @@ body.is-booting > .cards { visibility: hidden; }
     </div>
 
     <div class="field">
-      <label>Hands-free mode (double-tap the hotkey)</label>
-      <div class="check-row">
-        <input type="checkbox" id="s-latch-mode">
-        <span>Paste text every few seconds while recording</span>
-      </div>
-    </div>
-
-    <div class="field full">
-      <label for="s-chunk-sec">Seconds between pastes</label>
-      <input id="s-chunk-sec" type="number" min="2" max="60" step="1" value="10">
-    </div>
-
-    <div class="field">
       <label>Recording indicator</label>
       <div class="check-row">
         <input type="checkbox" id="s-pill">
-        <span>Show a floating indicator while recording (takes effect after relaunch)</span>
+        <span>Show a floating indicator while recording</span>
       </div>
-    </div>
-
-    <div class="field">
-      <label for="s-pillstyle">Indicator style (takes effect after relaunch)</label>
-      <select id="s-pillstyle">
-        <option value="bubbles">Bubbles &mdash; floating dots (the namesake)</option>
-        <option value="spectrogram">Spectrogram &mdash; scrolling sound waves</option>
-      </select>
     </div>
 
     <div class="field full">
@@ -1298,7 +1283,7 @@ body.is-booting > .cards { visibility: hidden; }
       <textarea id="s-vocab" rows="4" spellcheck="false" placeholder="Blooop&#10;Acme Widget"></textarea>
     </div>
   </div>
-  <div class="settings-hint">Hotkey changes apply live. Model changes download in background and apply after relaunch.</div>
+  <div class="settings-hint">Hotkey and sensitivity changes apply live. Model changes download in the background and apply after relaunch. The indicator setting applies after relaunch.</div>
   <div class="settings-runtime" id="settings-runtime-wrap">
     <span class="runtime-spinner" id="runtime-spinner"></span>
     <span id="settings-runtime"></span>
@@ -1912,25 +1897,18 @@ function restoreSettingsOpenState() {
   setSettingsOpen(open);
 }
 
-function updateChunkControlState() {
-  const enabled = document.getElementById('s-latch-mode').checked;
-  document.getElementById('s-chunk-sec').disabled = !enabled;
-}
-
 function readSettingsForm() {
-  let sec = parseFloat(document.getElementById('s-chunk-sec').value || '10');
-  if (!Number.isFinite(sec)) sec = 10;
-  sec = Math.max(2, Math.min(60, sec));
+  // Latch chunking and pill_style are intentionally absent: chunking is
+  // unconditional (normalize forces latch_chunk_mode true) and bubbles is the
+  // only pill style. The Python save path merges this payload over the stored
+  // settings, so a hand-edited latch_chunk_seconds is kept.
   return {
     model: document.getElementById('s-model').value,
     hotkey: document.getElementById('s-hotkey').value,
     silence_trim_preset: document.getElementById('s-silence').value,
     mic_sensitivity: document.getElementById('s-sensitivity').value,
     auto_paste: !!document.getElementById('s-auto-paste').checked,
-    latch_chunk_mode: !!document.getElementById('s-latch-mode').checked,
-    latch_chunk_seconds: sec,
     pill_window: !!document.getElementById('s-pill').checked,
-    pill_style: document.getElementById('s-pillstyle').value,
     custom_vocab: document.getElementById('s-vocab').value,
   };
 }
@@ -1954,15 +1932,7 @@ function applySettingsForm(s) {
     sensSel.value = s.mic_sensitivity;
   }
   document.getElementById('s-auto-paste').checked = !!s.auto_paste;
-  document.getElementById('s-latch-mode').checked = !!s.latch_chunk_mode;
-  if (s.latch_chunk_seconds != null) {
-    document.getElementById('s-chunk-sec').value = String(Math.round(s.latch_chunk_seconds));
-  }
   document.getElementById('s-pill').checked = s.pill_window !== false;
-  const styleSel = document.getElementById('s-pillstyle');
-  if ([...styleSel.options].some(o => o.value === s.pill_style)) {
-    styleSel.value = s.pill_style;
-  }
   const vocabEl = document.getElementById('s-vocab');
   // Don't rewrite the textarea mid-typing — the normalized form would yank
   // the cursor. It refreshes on next panel load / focus elsewhere.
@@ -1971,7 +1941,6 @@ function applySettingsForm(s) {
       ? s.custom_vocab.join('\\n')
       : String(s.custom_vocab || '');
   }
-  updateChunkControlState();
 }
 
 async function saveSettingsNow() {
@@ -1991,7 +1960,6 @@ async function saveSettingsNow() {
 
 function scheduleSettingsSave() {
   if (!settingsLoaded) return;
-  updateChunkControlState();
   setSettingsStatus('Pending…');
   if (settingsSaveTimer) clearTimeout(settingsSaveTimer);
   settingsSaveTimer = setTimeout(saveSettingsNow, 220);
@@ -2223,11 +2191,11 @@ function initSettingsBindings() {
   if (btn) btn.addEventListener('click', toggleSettingsPanel);
 
   const ids = ['s-model', 's-hotkey', 's-silence', 's-sensitivity', 's-auto-paste',
-               's-latch-mode', 's-chunk-sec', 's-pill', 's-pillstyle', 's-vocab'];
+               's-pill', 's-vocab'];
   ids.forEach((id) => {
     const el = document.getElementById(id);
     if (!el) return;
-    const evt = (id === 's-chunk-sec' || id === 's-vocab') ? 'input' : 'change';
+    const evt = (id === 's-vocab') ? 'input' : 'change';
     el.addEventListener(evt, scheduleSettingsSave);
   });
 
