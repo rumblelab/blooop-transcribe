@@ -849,6 +849,10 @@ body.is-booting > .cards { visibility: hidden; }
   border-radius: 16px;
   padding: 26px 24px 22px;
   box-shadow: 0 18px 50px rgba(0,0,0,0.45);
+  /* Stable floor so the light steps (welcome/mic/ax) don't make the card
+     jitter smaller as you move between them. The content-heavy model chooser
+     and the try step are taller than this by nature and grow past it. */
+  min-height: 400px;
 }
 .ob-dots {
   display: flex;
@@ -1005,18 +1009,35 @@ body.is-booting > .cards { visibility: hidden; }
 }
 .onboarding .runtime-progress { margin-top: 0; }
 .ob-try-card {
-  display: none;
+  /* Always in flow so it holds its slot; the take fades in without reflow
+     (visibility/opacity, not display). Height is bounded so a long take
+     scrolls inside the box instead of growing the card. */
+  opacity: 0;
+  visibility: hidden;
   background: var(--surface-2);
   border: 1px solid #1d6a55;
   border-radius: 10px;
   padding: 12px;
-  margin-bottom: 14px;
+  margin-bottom: 12px;
+  min-height: 42px;
+  max-height: 60px;
+  overflow-y: auto;
   font-size: 13px;
   color: var(--fg);
   white-space: pre-wrap;
   word-break: break-word;
+  transition: opacity 0.2s ease;
 }
-.ob-try-card.is-visible { display: block; }
+.ob-try-card.is-visible { opacity: 1; visibility: visible; }
+/* Reserved slot for the success card + Finish button. Held constant across
+   the "listening" and "landed" states so the try step never repaints/shifts. */
+.ob-try-reserved { min-height: 114px; }
+#ob-finish {
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.15s ease;
+}
+#ob-finish.is-visible { opacity: 1; visibility: visible; }
 .ob-state { flex-wrap: wrap; }
 .ob-state-link {
   background: none;
@@ -1305,7 +1326,7 @@ body.is-booting > .cards { visibility: hidden; }
       <div class="ob-title">Blooop</div>
       <div class="ob-copy">Hold the right-hand &#8984; Command key, speak, then let go &mdash; your words appear wherever your cursor is. Setup takes about a minute: two macOS permissions and a one-time model download.</div>
       <div class="ob-actions">
-        <button class="ob-btn" onclick="obSetStep('mic')">Get Started</button>
+        <button class="ob-btn" onclick="obAdvance('welcome')">Get Started</button>
       </div>
     </div>
 
@@ -1319,7 +1340,7 @@ body.is-booting > .cards { visibility: hidden; }
         <button class="ob-btn ghost" id="ob-mic-settings" onclick="obSend('open_privacy_mic')" style="display:none">Open System Settings</button>
       </div>
       <div class="ob-hint">Blooop re-checks automatically after you grant.</div>
-      <button class="ob-link" onclick="obSetStep('ax')">Skip for now</button>
+      <button class="ob-link" onclick="obAdvance('mic')">Skip for now</button>
     </div>
 
     <div class="ob-step" id="ob-step-ax">
@@ -1330,11 +1351,11 @@ body.is-booting > .cards { visibility: hidden; }
       <div class="ob-actions">
         <button class="ob-btn" id="ob-ax-request" onclick="obSend('request_ax')">Enable Accessibility</button>
         <button class="ob-btn ghost" id="ob-ax-settings" onclick="obSend('open_privacy_ax')" style="display:none">Open System Settings</button>
-        <button class="ob-btn" id="ob-ax-continue" onclick="obSetStep('model')" style="display:none">Continue</button>
+        <button class="ob-btn" id="ob-ax-continue" onclick="obAdvance('ax')" style="display:none">Continue</button>
         <button class="ob-btn ghost" id="ob-ax-relaunch" onclick="obSend('relaunch_app')" style="display:none">Relaunch Blooop</button>
       </div>
       <div class="ob-hint" id="ob-ax-hint">Blooop re-checks automatically after you grant.</div>
-      <button class="ob-link" onclick="obSetStep('model')">Skip for now</button>
+      <button class="ob-link" onclick="obAdvance('ax')">Skip for now</button>
     </div>
 
     <div class="ob-step" id="ob-step-model">
@@ -1372,10 +1393,10 @@ body.is-booting > .cards { visibility: hidden; }
         <div class="ob-progress-note" id="ob-model-note"></div>
         <div class="ob-actions">
           <button class="ob-btn" id="ob-model-retry" onclick="obSend('retry_model_download')" style="display:none">Retry download</button>
-          <button class="ob-btn" id="ob-model-continue" onclick="obSetStep('try')" style="display:none">Continue</button>
+          <button class="ob-btn" id="ob-model-continue" onclick="obAdvance('model')" style="display:none">Continue</button>
         </div>
       </div>
-      <button class="ob-link" onclick="obSetStep('try')">Skip for now</button>
+      <button class="ob-link" onclick="obAdvance('model')">Skip for now</button>
     </div>
 
     <div class="ob-step" id="ob-step-try">
@@ -1383,10 +1404,15 @@ body.is-booting > .cards { visibility: hidden; }
       <div class="ob-title">Try it</div>
       <div class="ob-copy" id="ob-try-copy">Click into the box below &mdash; or any app &mdash; hold right-&#8984;, and say something. Release, and your words paste right at your cursor.</div>
       <input id="ob-try-input" placeholder="Click here, then hold right-&#8984; and speak" spellcheck="false">
-      <div class="ob-try-card" id="ob-try-success"><span id="ob-try-text"></span></div>
       <div class="ob-state" id="ob-try-state">Listening for your first take&hellip;</div>
-      <div class="ob-actions">
-        <button class="ob-btn" id="ob-finish" onclick="obFinish()" style="display:none">Finish</button>
+      <!-- Reserved region: the success card and Finish button fade in here
+           (visibility/opacity, never DOM growth) so a landed take can't
+           reflow the card. Sized by min-height for its largest state. -->
+      <div class="ob-try-reserved" id="ob-try-reserved">
+        <div class="ob-try-card" id="ob-try-success"><span id="ob-try-text"></span></div>
+        <div class="ob-actions">
+          <button class="ob-btn" id="ob-finish" onclick="obFinish()">Finish</button>
+        </div>
       </div>
       <div class="ob-hint" id="ob-try-stuck" style="display:none">Nothing happening when you hold the key?
         <button class="ob-state-link" onclick="obSend('relaunch_app')">Relaunch Blooop</button> &mdash; macOS sometimes needs it after granting Accessibility.</div>
@@ -1530,6 +1556,7 @@ let obTryBaseline = null;      // {row id -> status} snapshot at try-step open
 let obTryBaselineLoading = false;
 let obTryEnteredAt = null;     // Date.now() when the try step opened
 let obAdvanceTimer = null;
+let obAdvanceFrom = null;       // step the pending advance was scheduled from
 // Set when Finish/Skip is clicked: the backend needs up to a poll cycle to
 // flip onboarding_active off, and a stale active:true must not obShow(true)
 // the wizard back at the Welcome step. Cleared once the backend confirms
@@ -1566,7 +1593,9 @@ function obHotkeyGlyph() {
 function obSetStep(step) {
   if (obStep === step) return;
   obStep = step;
+  // Leaving a step cancels any advance that was pending on it.
   if (obAdvanceTimer) { clearTimeout(obAdvanceTimer); obAdvanceTimer = null; }
+  obAdvanceFrom = null;
   if (step === 'try') { obTryBaseline = null; obTryEnteredAt = Date.now(); obTryCaptureBaseline(); }
   OB_STEPS.forEach((s) => {
     const el = document.getElementById('ob-step-' + s);
@@ -1585,12 +1614,49 @@ function obSetStep(step) {
   }
 }
 
-function obScheduleAdvance(next, delay) {
-  // Brief pause on the fresh checkmark before moving on, once per step.
+// A step is "actionable" while it still needs the user. Satisfied steps are
+// skipped in passing — never rendered — instead of flashing for a moment.
+// welcome and try are always shown when reached.
+function obStepActionable(step, s) {
+  s = s || {};
+  if (step === 'mic') return (s.mic_status || 'unknown') !== 'granted';
+  if (step === 'ax') return (s.ax_status || 'denied') !== 'granted';
+  // An unchosen model on a fresh install is not ready, so it IS actionable;
+  // a downloading/failed model is likewise not ready. Only a ready runtime
+  // model (resumed wizard, cache filled) is satisfied and skippable.
+  if (step === 'model') return s.model_ready === false;
+  return true;
+}
+
+// The step to land on after `from`: the first still-actionable step in fixed
+// order, else the try step (terminal). Welcome is never a landing spot, and
+// skipping never renumbers — the kicker/dots reflect each step's fixed slot.
+function obNextStep(from, s) {
+  for (let i = OB_STEPS.indexOf(from) + 1; i < OB_STEPS.length; i++) {
+    const step = OB_STEPS[i];
+    if (step === 'try' || obStepActionable(step, s)) return step;
+  }
+  return 'try';
+}
+
+// Advance out of `from`, skipping satisfied steps. Used by Get Started,
+// Continue, Skip, and the watched-satisfied timer below.
+function obAdvance(from) {
+  obSetStep(obNextStep(from, obLastStatus));
+}
+
+function obScheduleAdvance(from, delay) {
+  // Watched-satisfied hold: the user just granted/finished on THIS visible
+  // step, so let the checkmark land ~900ms before moving on — don't advance
+  // on the very next poll tick. One timer at a time (guards a poll racing the
+  // timeout), and it re-checks it's still the same step at fire so a mid-wait
+  // navigation cancels the advance.
   if (obAdvanceTimer) return;
+  obAdvanceFrom = from;
   obAdvanceTimer = setTimeout(() => {
     obAdvanceTimer = null;
-    obSetStep(next);
+    obAdvanceFrom = null;
+    if (obStep === from) obAdvance(from);
   }, delay);
 }
 
@@ -1609,7 +1675,7 @@ function obShow(show) {
       tryState.className = 'ob-state';
     }
     const finish = document.getElementById('ob-finish');
-    if (finish) finish.style.display = 'none';
+    if (finish) finish.classList.remove('is-visible');
     const tryInput = document.getElementById('ob-try-input');
     if (tryInput) tryInput.value = '';
     const stuck = document.getElementById('ob-try-stuck');
@@ -1655,7 +1721,7 @@ function updateOnboarding(s) {
     micState.className = 'ob-state is-ok';
     micReq.style.display = 'none';
     micSet.style.display = 'none';
-    if (obStep === 'mic') obScheduleAdvance('ax', 900);
+    if (obStep === 'mic') obScheduleAdvance('mic', 900);
   } else if (mic === 'denied') {
     micState.textContent = '\\u2715 Denied \\u2014 turn on Blooop in System Settings \\u2192 Privacy & Security \\u2192 Microphone, then come back.';
     micState.className = 'ob-state is-bad';
@@ -1685,6 +1751,10 @@ function updateOnboarding(s) {
     axHint.textContent = hotkey
       ? 'All set \\u2014 hit Continue.'
       : "If the hotkey doesn't respond in a few seconds, relaunch \\u2014 macOS sometimes requires it.";
+    // Watched grant: hold the checkmark, then advance. Only once the hotkey is
+    // live, so a Mac that still needs a relaunch keeps its relaunch prompt here
+    // rather than being auto-pushed to the (dead-hotkey) try step.
+    if (obStep === 'ax' && hotkey) obScheduleAdvance('ax', 900);
   } else {
     axState.textContent = 'Not granted yet';
     axState.className = 'ob-state';
@@ -1811,7 +1881,7 @@ function obRenderModelStep(s) {
     mState.className = 'ob-state';
     mNote.textContent = '';
   }
-  if (obStep === 'model' && modelReady) obScheduleAdvance('try', 900);
+  if (obStep === 'model' && modelReady) obScheduleAdvance('model', 900);
 }
 
 async function obTryCaptureBaseline() {
@@ -1846,7 +1916,7 @@ async function obCheckTryIt() {
         const st = document.getElementById('ob-try-state');
         st.textContent = "\\u2713 That's it \\u2014 you're set.";
         st.className = 'ob-state is-ok';
-        document.getElementById('ob-finish').style.display = '';
+        document.getElementById('ob-finish').classList.add('is-visible');
         break;
       }
     }

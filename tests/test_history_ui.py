@@ -210,13 +210,18 @@ class HistoryUiTests(unittest.TestCase):
     def test_wizard_every_gated_step_has_escape_hatch(self):
         # A user who denies mic (or can't grant AX on a managed Mac) must
         # never be soft-locked behind the full-screen overlay: mic, AX and
-        # model steps each offer "Skip for now", walking through to the try
-        # step whose own skip calls obFinish() and writes the marker.
+        # model steps each offer "Skip for now". Skip now routes through
+        # obAdvance() (which skips satisfied steps) rather than a hard-coded
+        # target, but still always walks through to the try step whose own
+        # skip calls obFinish() and writes the marker.
         html = self.ui.HTML
-        self.assertIn("onclick=\"obSetStep('ax')\">Skip for now", html)
-        self.assertIn("onclick=\"obSetStep('model')\">Skip for now", html)
-        self.assertIn("onclick=\"obSetStep('try')\">Skip for now", html)
+        self.assertIn("onclick=\"obAdvance('mic')\">Skip for now", html)
+        self.assertIn("onclick=\"obAdvance('ax')\">Skip for now", html)
+        self.assertIn("onclick=\"obAdvance('model')\">Skip for now", html)
         self.assertIn('onclick="obFinish()">Skip and finish setup', html)
+        # obNextStep never returns anything past the terminal try step, so a
+        # chain of skips can only ever land on try — no soft-lock.
+        self.assertIn("return 'try';", html)
 
     def test_settings_offers_run_setup_again(self):
         html = self.ui.HTML
@@ -248,7 +253,7 @@ class HistoryUiTests(unittest.TestCase):
         self.assertIn("mRetry.style.display = (failed && !modelReady)", html)
         self.assertIn("mCont.style.display = modelReady", html)
         self.assertIn(
-            "if (obStep === 'model' && modelReady) obScheduleAdvance('try', 900);",
+            "if (obStep === 'model' && modelReady) obScheduleAdvance('model', 900);",
             html,
         )
 
@@ -326,6 +331,71 @@ class HistoryUiTests(unittest.TestCase):
         self.assertIn("before === undefined || before !== 'ok'", html)
         self.assertNotIn("obTryOpenedAt", html)
         self.assertNotIn("created_at || ''", html.split("function obCheckTryIt")[1].split("}")[0])
+
+    def test_wizard_skips_satisfied_steps_when_advancing(self):
+        # Owner feedback: an already-satisfied step must never flash on screen.
+        # Advancing (Get Started / Continue / Skip / the auto-advance timer)
+        # computes the next ACTIONABLE step and skips satisfied ones in
+        # passing, rather than rendering each for a moment.
+        html = self.ui.HTML
+        # The actionability + next-step helpers exist and gate on the runtime
+        # status fields the wizard already polls.
+        self.assertIn("function obStepActionable(step, s)", html)
+        self.assertIn("function obNextStep(from, s)", html)
+        self.assertIn("function obAdvance(from)", html)
+        self.assertIn("(s.mic_status || 'unknown') !== 'granted'", html)
+        self.assertIn("(s.ax_status || 'denied') !== 'granted'", html)
+        # An unchosen/downloading/failed model is not ready, so it is
+        # actionable; only a ready runtime model is skippable.
+        self.assertIn("if (step === 'model') return s.model_ready === false;", html)
+        # try is terminal — never skipped, always the fallback landing spot.
+        self.assertIn("if (step === 'try' || obStepActionable(step, s)) return step;", html)
+        self.assertIn("return 'try';", html)
+        # The welcome button and every Continue/Skip route through obAdvance so
+        # the skip is computed from the live status, not hard-coded.
+        self.assertIn("onclick=\"obAdvance('welcome')\">Get Started", html)
+        self.assertIn("id=\"ob-ax-continue\" onclick=\"obAdvance('ax')\"", html)
+        self.assertIn("id=\"ob-model-continue\" onclick=\"obAdvance('model')\"", html)
+
+    def test_wizard_holds_watched_satisfied_step_before_advancing(self):
+        # When a VISIBLE step becomes satisfied while the user watches (they
+        # grant mic/ax, the download finishes), the wizard renders the ✓ state
+        # and holds ~900ms before advancing — it must not jump on the next
+        # poll tick. The timer is single-fire (guards a poll racing it),
+        # re-checks it is still the same step at fire, and is cancelled when
+        # the user leaves the step.
+        html = self.ui.HTML
+        self.assertIn("function obScheduleAdvance(from, delay)", html)
+        self.assertIn("if (obAdvanceTimer) return;", html)
+        self.assertIn("if (obStep === from) obAdvance(from);", html)
+        # Leaving a step clears the pending advance.
+        self.assertIn("obAdvanceFrom = null;", html)
+        # Each gated step schedules the hold from its own id at the 900ms beat.
+        self.assertIn("if (obStep === 'mic') obScheduleAdvance('mic', 900);", html)
+        self.assertIn("if (obStep === 'ax' && hotkey) obScheduleAdvance('ax', 900);", html)
+        self.assertIn(
+            "if (obStep === 'model' && modelReady) obScheduleAdvance('model', 900);",
+            html,
+        )
+
+    def test_wizard_try_step_reserves_space_no_reflow(self):
+        # Owner feedback: the success card / Finish button appearing after the
+        # wait repainted and shifted the modal. They now fade into a reserved
+        # region (visibility/opacity, not DOM growth) and the card carries a
+        # stable min-height so step changes don't jump its size either.
+        html = self.ui.HTML
+        self.assertIn('id="ob-try-reserved"', html)
+        self.assertIn('class="ob-try-reserved"', html)
+        self.assertIn(".ob-try-reserved { min-height:", html)
+        # The success card stays in flow and toggles via opacity/visibility.
+        self.assertIn("visibility: hidden;", html)
+        self.assertIn(".ob-try-card.is-visible { opacity: 1; visibility: visible; }", html)
+        self.assertIn("#ob-finish.is-visible { opacity: 1; visibility: visible; }", html)
+        # Finish is toggled by class, not display (which would reflow).
+        self.assertIn("document.getElementById('ob-finish').classList.add('is-visible');", html)
+        self.assertIn("finish.classList.remove('is-visible')", html)
+        # The card floor keeps the light steps from jittering smaller.
+        self.assertIn("min-height: 400px;", html)
 
     def test_boot_hides_app_until_first_wizard_decision(self):
         # Fresh installs must not flash the normal history UI for the ~1s the
